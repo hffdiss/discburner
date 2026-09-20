@@ -65,11 +65,11 @@ case "$version_arg" in
     "")            version="$current_version" ;;
     major|minor|patch) version="$(bump "$current_version" "$version_arg")" ;;
     [0-9]*.[0-9]*.[0-9]*) version="$version_arg" ;;
-    *) die "版本号要写成 X.Y.Z，或者用 major / minor / patch 自动 +1（当前 $current_version）" ;;
+    *) die "版本号要写成 X.Y.Z，或者用 major / minor / patch 自动 +1（当前 ${current_version}）" ;;
 esac
 
 tag="v$version"
-say "版本：$current_version → $version（tag $tag）"
+say "版本：$current_version → ${version}（tag ${tag}）"
 
 # ---------------------------------------------------------------- 2. 工作区检查
 
@@ -80,7 +80,7 @@ if [ -n "$(git status --porcelain)" ] && [ "$allow_dirty" = "0" ]; then
 fi
 
 if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-    die "本地已经有 $tag 了，换个版本号（或先 git tag -d $tag）"
+    die "本地已经有 $tag 了，换个版本号（或先 git tag -d ${tag}）"
 fi
 
 # ---------------------------------------------------------------- 3. 凭据（先检查，别构建完了才发现推不上去）
@@ -108,7 +108,7 @@ raise SystemExit(1)
 
 # ---------------------------------------------------------------- 3. 构建 + 自检
 
-say "构建 $version（约 110 秒）"
+say "构建 ${version}（约 110 秒）"
 VERSION="$version" ./build.sh >/tmp/discburner-build.log 2>&1 || {
     tail -20 /tmp/discburner-build.log >&2
     die "构建失败，日志在 /tmp/discburner-build.log"
@@ -212,7 +212,7 @@ fi
 
 for file in "$dmg" "$zip"; do
     name="$(basename "$file")"
-    say "上传 $name（$(du -h "$file" | cut -f1 | tr -d ' ')）"
+    say "上传 ${name}（$(du -h "$file" | cut -f1 | tr -d ' ')）"
     upload="$(curl -sS -X POST \
         "https://uploads.github.com/repos/$REPO/releases/$release_id/assets?name=$name" \
         -H "Authorization: Bearer $token" \
