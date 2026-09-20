@@ -429,8 +429,19 @@ Sources/discburn/           # 命令行工具
 Sources/DiscBurnerApp/      # SwiftUI 图形界面
 Sources/DiscBurnSelfTest/   # 自检程序
 Tools/make_icon.swift       # 生成 App 图标
+Tools/sync.sh               # 改完之后：跑自检 → 提交 → 推送到 GitHub
 build.sh                    # 一键构建 + 打包 .app
+AGENTS.md                   # 项目约定（中文、构建方式、真机注意事项）
 ```
+
+改完代码想直接同步到远端：
+
+```bash
+./Tools/sync.sh "这次改了什么" --test   # 先跑自检，过了才提交并推送到 origin/main
+```
+
+每次 `git commit` 之后，`.git/hooks/post-commit` 也会自动把 `main` 推到
+`github.com/hffdiss/discburner`（结果记在 `.git/post-commit-push.log`，失败不影响提交）。
 
 ## 免责声明
 
