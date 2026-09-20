@@ -13,6 +13,7 @@
 #   ./build.sh                     # 完整构建 + 打包
 #   ARCHS=x86_64 ./build.sh        # 只编当前架构，快一些
 #   ./build.sh --no-package        # 只构建 App，不生成 DMG/ZIP
+#   VERSION=1.2.3 ./build.sh       # 临时指定版本号（默认读仓库根的 VERSION 文件）
 #
 set -euo pipefail
 
@@ -21,7 +22,8 @@ BUILD="$ROOT/.build-manual"
 DIST="$ROOT/dist"
 ARCHS="${ARCHS:-x86_64 arm64}"
 DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET:-11.0}"
-VERSION="${VERSION:-1.0.0}"
+# 版本号的唯一出处是仓库根的 VERSION 文件；命令行用 VERSION=x.y.z 可以临时覆盖。
+VERSION="${VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null || echo 1.0.0)}"
 PACKAGE=1
 
 for argument in "$@"; do

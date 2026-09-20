@@ -45,8 +45,11 @@ open dist/DiscBurner.app   # 打开图形界面
 | 产物 | 说明 |
 | --- | --- |
 | `dist/DiscBurner.app` | 可执行的应用包（Intel + Apple Silicon 通用二进制） |
-| `dist/DiscBurner-1.0.0.dmg` | 安装镜像：打开后把 App 拖进「应用程序」即可 |
-| `dist/DiscBurner-1.0.0.zip` | 压缩包，解压即用 |
+| `dist/DiscBurner-<版本>.dmg` | 安装镜像：打开后把 App 拖进「应用程序」即可 |
+| `dist/DiscBurner-<版本>.zip` | 压缩包，解压即用 |
+
+版本号的唯一出处是仓库根的 `VERSION` 文件（目前 `1.0.0`），构建时会写进
+`Info.plist` 的 `CFBundleShortVersionString`、App 的「关于」面板和产物文件名。
 
 App 包内已经包含：
 
@@ -81,8 +84,34 @@ ln -s /Applications/DiscBurner.app/Contents/MacOS/discburn /usr/local/bin/discbu
 ./build.sh                    # 默认：x86_64 + arm64 通用二进制 + DMG + ZIP
 ARCHS=x86_64 ./build.sh       # 只编当前架构，快一倍
 ./build.sh --no-package       # 只构建 App，不生成 DMG/ZIP
-VERSION=1.2.3 ./build.sh      # 指定版本号（写进 Info.plist 和产物文件名）
+VERSION=1.2.3 ./build.sh      # 临时指定版本号（不改 VERSION 文件）
 ```
+
+### 发新版本
+
+版本号用 `X.Y.Z`；发版一条命令，构建、自检、打 tag、上传 Release 一气呵成：
+
+```bash
+./Tools/release.sh patch "修了追加写"    # 1.0.0 → 1.0.1，说明写进发布正文
+./Tools/release.sh minor                # 1.0.1 → 1.1.0
+./Tools/release.sh 2.0.0                # 直接指定
+./Tools/release.sh patch --draft        # 先发成草稿，检查完再在网页上发布
+```
+
+脚本会依次做这些事（任一步失败就停下，不会发半个版本出去）：
+
+1. 检查工作区是否干净、这个 tag 有没有用过、GitHub 凭据能不能访问仓库
+2. 用新版本号跑 `./build.sh`（产物是 `dist/DiscBurner-<版本>.dmg` / `.zip`）
+3. 跑 262 项自检，不过不发版
+4. 把版本号写回 `VERSION`、提交、打 `vX.Y.Z` tag 并推送（`main` 由 post-commit 钩子推）
+5. 调 GitHub API 建 Release，把 `.dmg` 和 `.zip` 作为附件传上去
+
+发布说明默认自动生成（列出上一个 tag 以来的提交 + 自检结果 + 安装步骤），
+也可以用 `--notes "..."` 或 `--notes-file 文件` 覆盖。
+凭据默认取 git 的 credential helper（本机存在 `~/.git-credentials`），
+也可以用 `GITHUB_TOKEN=xxx ./Tools/release.sh ...` 临时指定。
+
+只想看效果不想真发：加 `--dry-run`，它会把构建、自检和发布说明都跑一遍就停手。
 
 ## 图形界面
 

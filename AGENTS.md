@@ -24,6 +24,18 @@
 
 例外：用户明确说「先别提交 / 先别推」时，就只改文件、不提交。
 
+## 发新版本
+
+版本号在仓库根的 `VERSION` 文件里（`X.Y.Z`），发版一条命令：
+
+```bash
+./Tools/release.sh patch "这次改了什么"    # 或 minor / major / 直接写 1.2.3
+```
+
+它会构建、跑自检、改 `VERSION`、提交、打 `vX.Y.Z` tag、建 GitHub Release，
+并把 `dist/DiscBurner-<版本>.dmg` 与 `.zip` 传上去。
+没验证过就先 `--dry-run`；想先发草稿就 `--draft`。发版前工作区必须是干净的。
+
 ## 真机相关的注意事项
 
 - 光驱：PIONEER DVD-RW DVR-XU01C（USB，`drutil` 里显示 `SupportLevel: Unsupported`，但可用）。
