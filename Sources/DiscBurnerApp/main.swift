@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 import DiscBurnKit
 
 /// 离屏渲染整个界面并写成 PNG，用来在无窗口环境下自检：
@@ -18,7 +19,15 @@ func renderPreview(
     RunLoop.main.run(until: Date().addingTimeInterval(items.isEmpty ? 1.5 : 4.0))
 
     let host = NSHostingView(rootView: makeView(model))
+    // 离屏渲染没有窗口，SwiftUI 默认按「浅色」画，而 NSColor 这类动态颜色
+    // 是按 App 当前外观解析的，两边对不上就会出现「黑字画在黑底上」。
+    // 明确把渲染视图的外观对齐成 App 当前外观，出来才和真窗口一致。
+    host.appearance = NSApp.effectiveAppearance
     host.frame = NSRect(x: 0, y: 0, width: size.width, height: size.height)
+    // 离屏渲染没有窗口时 `NSAppearance.current` 还是「浅色」，而分栏视图里的面板
+    // 是各自独立的视图，会照 current 解析动态颜色 —— 不设的话左半边会画成浅色。
+    let savedAppearance = NSAppearance.current
+    NSAppearance.current = host.appearance
     // SwiftUI 在离屏渲染时通常要两轮布局才能把文字画全，这里多走一圈。
     host.layoutSubtreeIfNeeded()
     RunLoop.main.run(until: Date().addingTimeInterval(0.5))
@@ -29,6 +38,7 @@ func renderPreview(
         exit(2)
     }
     host.cacheDisplay(in: host.bounds, to: rep)
+    NSAppearance.current = savedAppearance
     guard let data = rep.representation(using: .png, properties: [:]) else {
         FileHandle.standardError.write("渲染失败：无法生成 PNG\n".data(using: .utf8)!)
         exit(2)
@@ -79,25 +89,40 @@ func renderPreview(
 
 /// 应用入口。使用 NSApplication + NSHostingView 而不是 SwiftUI 的 `App` 协议，
 /// 这样既能在 SwiftPM 下直接编译出可执行文件，也不依赖 Xcode 工程。
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NSToolbarItemValidation {
     private var window: NSWindow?
+    private var cancellables = Set<AnyCancellable>()
     let model = AppModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1020, height: 700),
+            contentRect: NSRect(x: 0, y: 0, width: 1020, height: 660),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "光盘刻录"
-        window.minSize = NSSize(width: 900, height: 620)
-        window.center()
+        window.minSize = NSSize(width: 940, height: 560)
+        window.tabbingMode = .disallowed
         window.contentView = NSHostingView(rootView: ContentView().environmentObject(model))
+        // 工具栏 + 统一标题栏：动作都在标题栏里，窗口内不再重复一条「标题 + 刷新」的头栏。
+        window.toolbar = makeToolbar()
+        window.toolbarStyle = .unified
+        // 窗口大小/位置按 macOS 惯例记住；第一次打开再居中。
+        if !window.setFrameAutosaveName("DiscBurnerMain") {
+            window.center()
+        }
         window.makeKeyAndOrderFront(nil)
         self.window = window
+
+        // 标题栏副标题跟着光驱与介质状态走，随时能看出当前这张盘的情况。
+        model.$status
+            .combineLatest(model.$drives, model.$selectedDriveIndex, model.$statusError)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _, _, _, _ in self?.updateSubtitle() }
+            .store(in: &cancellables)
 
         NSApp.activate(ignoringOtherApps: true)
 
@@ -116,10 +141,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+
+        // 截屏用：把「刻录完成」弹窗直接摆出来，不必真的刻一张盘。
+        if launchArguments.contains("--demo-notice") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                let free = self?.model.status.writableBytes.map { "，还剩 \(ByteText.human($0))" } ?? ""
+                self?.model.finishedMessage = "刻录完成 · 光盘仍可继续追加\(free)。\n用时 35 秒。"
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    // MARK: - 工具栏
+
+    private enum ToolbarID {
+        static let addFiles = NSToolbarItem.Identifier("discburn.addFiles")
+        static let addFolder = NSToolbarItem.Identifier("discburn.addFolder")
+        static let discContents = NSToolbarItem.Identifier("discburn.discContents")
+        static let refresh = NSToolbarItem.Identifier("discburn.refresh")
+    }
+
+    private func makeToolbar() -> NSToolbar {
+        let toolbar = NSToolbar(identifier: "discburn.main")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        return toolbar
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [ToolbarID.addFiles, ToolbarID.addFolder, .flexibleSpace, ToolbarID.discContents, ToolbarID.refresh]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        toolbarDefaultItemIdentifiers(toolbar)
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        switch itemIdentifier {
+        case ToolbarID.addFiles:
+            item.image = NSImage(systemSymbolName: "doc.badge.plus", accessibilityDescription: "添加文件")
+            item.label = "添加文件"
+            item.paletteLabel = "添加文件"
+            item.toolTip = "把文件加入要刻录的内容（⌘O）"
+            item.target = self
+            item.action = #selector(addFiles)
+        case ToolbarID.addFolder:
+            item.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: "添加文件夹")
+            item.label = "添加文件夹"
+            item.paletteLabel = "添加文件夹"
+            item.toolTip = "把整个文件夹加入要刻录的内容（⇧⌘O）"
+            item.target = self
+            item.action = #selector(addFolder)
+        case ToolbarID.discContents:
+            item.image = NSImage(systemSymbolName: "list.bullet.rectangle", accessibilityDescription: "光盘内容")
+            item.label = "光盘内容"
+            item.paletteLabel = "光盘内容"
+            item.toolTip = "查看光盘里已有的内容（⌘I）"
+            item.target = self
+            item.action = #selector(showContents)
+        case ToolbarID.refresh:
+            item.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "刷新")
+            item.label = "刷新"
+            item.paletteLabel = "刷新"
+            item.toolTip = "重新读取光驱与介质状态（⌘R）"
+            item.target = self
+            item.action = #selector(refreshDrives)
+        default:
+            return nil
+        }
+        return item
+    }
+
+    /// 正在刻录时把工具栏动作一并禁掉，避免中途改列表。
+    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        !model.isBusy
+    }
+
+    /// 标题栏副标题：当前光驱 + 介质摘要。
+    private func updateSubtitle() {
+        if let drive = model.drives.first(where: { $0.index == model.selectedDriveIndex }) {
+            window?.subtitle = "\(drive.displayName) · \(model.status.summary)"
+        } else if let error = model.statusError {
+            window?.subtitle = "光驱不可用：\(error)"
+        } else {
+            window?.subtitle = "未检测到光驱，请连接外置光驱"
+        }
     }
 
     private func buildMenu() {

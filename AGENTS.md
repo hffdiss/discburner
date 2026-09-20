@@ -46,6 +46,19 @@
   `drutil eject` + `drutil tray close` 循环几次、或手动弹出再放回即可恢复，盘上的数据不受影响。
 - 任何会写盘的验证都要先跟用户确认，别拿用户的盘做实验。
 
+## 看界面的正确姿势
+
+- **优先看真窗口**：`open dist/DiscBurner.app`，然后
+  `osascript -e 'tell application "System Events" to tell process "DiscBurner" to get {position, size} of window 1'`
+  拿到位置，再 `screencapture -x -R x,y,w,h /tmp/shot.png`。这是唯一可靠的界面验收方式。
+- **`--render-preview` 只当粗略参考**：离屏渲染没有窗口，左栏「要刻录的内容」那块
+  （`List` / `VSplitView` 撑起来的部分）画不出来，会出现黑块和缺文字，别据此判断 UI 坏了；
+  右栏、底栏是准的。
+- 截图用的启动参数有顺序要求：解析时先找 `--demo-compatibility`，所以两者同时用要写成
+  `--args --demo-compatibility --demo-items <路径…>`，反了会加不进内容。
+  `--demo-notice` 可以把「刻录完成」弹窗直接摆出来（不用真刻盘）。
+- 第一次让新构建的 App 读光盘时，macOS 可能弹「想访问可移除宗卷上的文件」，选「允许」。
+
 ## 目录结构
 
 ```

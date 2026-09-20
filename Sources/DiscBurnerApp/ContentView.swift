@@ -22,8 +22,6 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            Divider()
             HStack(alignment: .top, spacing: 0) {
                 fileColumn
                 Divider()
@@ -32,7 +30,7 @@ struct ContentView: View {
             Divider()
             statusBar
         }
-        .frame(minWidth: 980, minHeight: 660)
+        .frame(minWidth: 940, minHeight: 560)
         .onChange(of: model.lastError) { value in
             if let value = value {
                 activeAlert = .error(value)
@@ -84,53 +82,6 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 顶部
-
-    private var header: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "opticaldiscdrive")
-                .font(.system(size: 26))
-                .foregroundColor(.accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("光盘刻录")
-                    .font(.system(size: 17, weight: .semibold))
-                Text(driveSummary)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-            }
-            Spacer()
-            if model.drives.count > 1 {
-                Picker("", selection: Binding(
-                    get: { model.selectedDriveIndex ?? 0 },
-                    set: { model.selectedDriveIndex = $0; model.refresh() }
-                )) {
-                    ForEach(model.drives) { drive in
-                        Text("#\(drive.index) \(drive.displayName)").tag(drive.index)
-                    }
-                }
-                .frame(width: 240)
-            }
-            Button {
-                model.refresh()
-            } label: {
-                Label("刷新", systemImage: "arrow.clockwise")
-            }
-            .disabled(model.isBusy)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-    }
-
-    private var driveSummary: String {
-        if let drive = model.drives.first(where: { $0.index == model.selectedDriveIndex }) {
-            return "\(drive.displayName) · \(model.status.summary)"
-        }
-        if let error = model.statusError {
-            return "光驱不可用：\(error)"
-        }
-        return "未检测到光驱，请连接外置光驱"
-    }
-
     // MARK: - 左侧文件列表
 
     /// 左栏 = 上面「光盘里已有的内容」+ 下面「要刻录的内容」，中间可以拖动调整高度。
@@ -159,12 +110,7 @@ struct ContentView: View {
                 Text("要刻录的内容")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                Button(action: addFiles) {
-                    Label("添加文件", systemImage: "doc.badge.plus")
-                }
-                Button(action: addFolder) {
-                    Label("添加文件夹", systemImage: "folder.badge.plus")
-                }
+                // 添加动作统一放在窗口工具栏里，这里只留「清空」，避免同一排按钮重复两遍。
                 Button(action: { model.clearItems() }) {
                     Image(systemName: "trash")
                 }
@@ -290,17 +236,33 @@ struct ContentView: View {
     }
 
     private var dropPlaceholder: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 12) {
             Image(systemName: "square.and.arrow.down.on.square")
-                .font(.system(size: 40))
+                .font(.system(size: 44, weight: .light))
                 .foregroundColor(.secondary)
-            Text("把文件或文件夹拖到这里")
-                .foregroundColor(.secondary)
-            Text("支持任意文件类型，目录结构会被保留")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
+            VStack(spacing: 4) {
+                Text("把文件或文件夹拖到这里")
+                    .font(.headline)
+                    .foregroundColor(.secondary)
+                Text("支持任意文件类型，目录结构会被保留")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            HStack(spacing: 8) {
+                Button("选择文件…", action: addFiles)
+                Button("选择文件夹…", action: addFolder)
+            }
+            .disabled(model.isBusy)
+            .padding(.top, 2)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(20)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [7, 6]))
+                .foregroundColor(Color.primary.opacity(0.16))
+                .padding(14)
+        )
         .background(Color(NSColor.windowBackgroundColor))
     }
 
@@ -383,6 +345,22 @@ struct ContentView: View {
                 }
 
                 section("介质") {
+                    if model.drives.count > 1 {
+                        HStack {
+                            Text("光驱")
+                            Spacer()
+                            Picker("", selection: Binding(
+                                get: { model.selectedDriveIndex ?? 0 },
+                                set: { model.selectedDriveIndex = $0; model.refresh() }
+                            )) {
+                                ForEach(model.drives) { drive in
+                                    Text("#\(drive.index) \(drive.displayName)").tag(drive.index)
+                                }
+                            }
+                            .frame(width: 170)
+                        }
+                        .disabled(model.isBusy)
+                    }
                     mediaPanel
                     Button {
                         model.showDiscContents = true
@@ -410,15 +388,7 @@ struct ContentView: View {
                     .disabled(!model.status.isPresent || model.isBusy)
                 }
 
-                section("操作") {
-                    Button {
-                        model.prepareBurn()
-                    } label: {
-                        Label(model.testBurn ? "开始测试刻录" : "开始刻录", systemImage: "opticaldiscdrive.fill")
-                        .frame(maxWidth: .infinity)
-                    }
-                    .disabled(!canBurn || model.isBusy || model.compatibilityScanning)
-
+                section("其他") {
                     Button {
                         saveImage()
                     } label: {
@@ -426,6 +396,10 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity)
                     }
                     .disabled(model.items.isEmpty || model.isBusy)
+                    Text("「开始刻录」固定在窗口右下角，滚动这一栏也不会被挡住。")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
             }
@@ -433,6 +407,22 @@ struct ContentView: View {
         }
         .frame(width: 340)
         .background(Color(NSColor.controlBackgroundColor))
+        // 底边一条渐隐，暗示这一栏还能继续往下滚（macOS 默认不常显滚动条）。
+        .overlay(
+            VStack(spacing: 0) {
+                Spacer(minLength: 0)
+                LinearGradient(
+                    gradient: Gradient(colors: [
+                        Color(NSColor.controlBackgroundColor).opacity(0),
+                        Color(NSColor.controlBackgroundColor),
+                    ]),
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 20)
+            }
+            .allowsHitTesting(false)
+        )
     }
 
     private var speedChoices: [Int] {
@@ -560,35 +550,57 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Spacer()
-                // 主操作放在底部状态栏里：右侧设置栏是滚动区，
-                // 窗口不够高时「开始刻录」会掉到折叠线以下，这里保证它永远可见。
-                if !model.isBusy {
-                    Button {
-                        model.prepareBurn()
-                    } label: {
-                        Label(model.testBurn ? "开始测试刻录" : "开始刻录", systemImage: "opticaldiscdrive.fill")
-                    }
-                    .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(!canBurn || model.compatibilityScanning)
-                    .help(canBurn
-                          ? "确认刻录内容后开始刻录"
-                          : "需要一张可写入的光盘（当前不可刻录）")
-                }
                 if !model.logLines.isEmpty {
                     Button(model.showLog ? "隐藏日志" : "显示日志") { model.showLog.toggle() }
                         .buttonStyle(PlainButtonStyle())
                         .foregroundColor(.accentColor)
                         .font(.system(size: 11))
                 }
+                Spacer(minLength: 12)
+                // 主操作固定在右下角：右侧设置栏是滚动区，
+                // 窗口不够高时「开始刻录」会掉到折叠线以下，这里保证它永远可见。
                 if model.isBusy {
                     Button("取消") { model.cancel() }
                         .keyboardShortcut(.escape, modifiers: [])
+                } else {
+                    primaryBurnButton
                 }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
+            .background(Color(NSColor.controlBackgroundColor))
         }
+    }
+
+    /// 右下角的主按钮。macOS 的习惯是主操作固定在窗口右下角，并且用强调色标出来，
+    /// 让人一眼看出「按下去就会开始刻录」。
+    ///
+    /// 这里手写强调色而不是用 `.borderedProminent`：那个 API 要 macOS 12，
+    /// 本项目的部署目标是 macOS 11。
+    private var primaryBurnButton: some View {
+        Button {
+            model.prepareBurn()
+        } label: {
+            Label(model.testBurn ? "开始测试刻录" : "开始刻录", systemImage: "opticaldiscdrive.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(burnButtonEnabled ? .white : Color(NSColor.secondaryLabelColor))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(burnButtonEnabled ? Color.accentColor : Color.primary.opacity(0.07))
+                )
+        }
+        .buttonStyle(PlainButtonStyle())
+        .keyboardShortcut(.return, modifiers: [.command])
+        .disabled(!burnButtonEnabled)
+        .help(burnButtonEnabled
+              ? "确认刻录内容后开始刻录（⌘⏎）"
+              : "需要一张可写入的光盘（当前不可刻录）")
+    }
+
+    private var burnButtonEnabled: Bool {
+        canBurn && !model.compatibilityScanning
     }
 
     // MARK: - 文件选择
