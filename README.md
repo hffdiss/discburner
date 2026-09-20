@@ -42,7 +42,7 @@ open dist/DiscBurner.app   # 打开图形界面
 
 不想自己编译的话，直接去 **[Releases](https://github.com/hffdiss/discburner/releases)** 下最新的
 `DiscBurner-<版本>.dmg`，打开后把「光盘刻录」拖进「应用程序」就行；
-`DiscBurner-<版本>.zip` 是解压即用的版本。当前版本 **1.0.0**。
+`DiscBurner-<版本>.zip` 是解压即用的版本。当前版本 **1.1.0**。
 
 `./build.sh` 会产出三样东西：
 
@@ -52,7 +52,7 @@ open dist/DiscBurner.app   # 打开图形界面
 | `dist/DiscBurner-<版本>.dmg` | 安装镜像：打开后把 App 拖进「应用程序」即可 |
 | `dist/DiscBurner-<版本>.zip` | 压缩包，解压即用 |
 
-版本号的唯一出处是仓库根的 `VERSION` 文件（目前 `1.0.0`），构建时会写进
+版本号的唯一出处是仓库根的 `VERSION` 文件（目前 `1.1.0`），构建时会写进
 `Info.plist` 的 `CFBundleShortVersionString`、App 的「关于」面板和产物文件名。
 
 App 包内已经包含：
