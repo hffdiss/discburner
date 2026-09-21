@@ -263,6 +263,16 @@ public enum MultisessionError: LocalizedError {
 
 /// 多区段相关的查询。
 public enum Multisession {
+    /// 这次刻录要不要做多区段嫁接（把新段接到旧内容后面）。
+    ///
+    /// 判据是「驱动器说这盘可以追加写入」，**不是**段数：驱动器会把空白盘上那条
+    /// 空白轨道也算成一段（实测空白 DVD+R 的 `discinfo` 就是 `Sessions: 1`），
+    /// 只看段数会把空盘误判成需要嫁接，直接拒绝刻录。
+    public static func needsGraft(status: DiscStatus, eraseFirst: Bool = false) -> Bool {
+        guard !eraseFirst else { return false }
+        return status.writability == .appendable
+    }
+
     /// 读 `drutil trackinfo`。
     public static func layout(driveIndex: Int? = nil) throws -> DiscLayout {
         var arguments: [String] = []

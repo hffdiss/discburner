@@ -997,6 +997,27 @@ run("解析 drutil trackinfo（段起始 / 下一个可写地址）") {
     expect(DiscLayout.parse(trackInfo: "  Track 1 info:\n     blank: true\n  nextWritableAddress: 0 (valid)\n").isEmpty, "纯空白盘没有已写段")
 }
 
+run("空白盘不算「要嫁接」：驱动器会把空白轨道也算成一段") {
+    // 实测：空白 DVD+R 的 drutil discinfo 就是 Sessions: 1，只看段数会把空盘
+    // 误判成需要嫁接，于是直接拒绝刻录（真机上踩过）。
+    var blank = DiscStatus()
+    blank.isPresent = true
+    blank.deviceNode = "/dev/disk2"
+    blank.sessions = 1
+    blank.writability = .blank
+    expectEqual(Multisession.needsGraft(status: blank), false, "空白盘不需要嫁接")
+
+    var appendable = blank
+    appendable.writability = .appendable
+    appendable.sessions = 2
+    expectEqual(Multisession.needsGraft(status: appendable), true, "可追加的盘要嫁接")
+    expectEqual(Multisession.needsGraft(status: appendable, eraseFirst: true), false, "先擦盘就不嫁接")
+
+    var overwritable = blank
+    overwritable.writability = .overwritable
+    expectEqual(Multisession.needsGraft(status: overwritable), false, "可覆盖的盘从零开始刻")
+}
+
 run("追加目标：空盘 / 擦盘 / 缺设备节点") {
     let layout = DiscLayout.parse(trackInfo: trackInfoSample)
     var status = DiscStatus()

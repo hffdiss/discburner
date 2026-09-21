@@ -475,7 +475,9 @@ public final class BurnJob {
     ) throws -> AppendPlan? {
         // 只生成映像、或者这次会先擦盘，都按「从零开始」处理。
         guard request.imageOnlyURL == nil, !request.burnOptions.eraseFirst else { return nil }
-        guard let reported = status.sessions, reported > 0 else { return nil }
+        // 只有「可追加写入」的盘才需要嫁接：空白盘、刚擦过的盘都属于从零开始。
+        guard Multisession.needsGraft(status: status, eraseFirst: request.burnOptions.eraseFirst) else { return nil }
+        let reported = status.sessions ?? 0
 
         let layout = (try? Multisession.layout(driveIndex: request.burnOptions.driveIndex)) ?? .empty
         guard !layout.isEmpty,
