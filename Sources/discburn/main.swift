@@ -738,7 +738,12 @@ func commandContents(options: Options) throws {
         let layout = (try? Multisession.layout(driveIndex: drive.index)) ?? .empty
         if !layout.isEmpty,
            let whole = DiscContentReader.read(deviceNode: device, layout: layout) {
-            contents = whole.asDiscContents(source: device, media: status.media, mediaID: status.mediaID)
+            contents = whole.asDiscContents(
+                source: device,
+                media: status.media,
+                mediaID: status.mediaID,
+                sessionCount: layout.recordedSessions
+            )
             if layout.recordedSessions > 1 {
                 contents.note = "这张盘是多区段盘：系统挂载只会显示其中一段，"
                     + "上面列的是按扇区读出来的全部 \(layout.recordedSessions) 个区段。"

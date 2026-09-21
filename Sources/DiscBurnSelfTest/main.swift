@@ -1567,6 +1567,14 @@ run("整盘内容：转成界面用的树（文件夹在前、大小对得上）
     expectEqual(tree.directoryCount, 2, "文件夹数（含自动补出来的子目录）")
     expectEqual(tree.totalBytes, 2153, "总字节数")
     expectEqual(tree.sessionCount, 2, "区段数带过去")
+    expectEqual(
+        content.asDiscContents(source: "/dev/disk4", sessionCount: 4).sessionCount,
+        4,
+        "段数由调用方从驱动器 TOC 传进来（嫁接过的盘只读最后一段，段数会少于盘上实际段数）"
+    )
+    var graftedView = content
+    graftedView.sessions = [2512]
+    expectEqual(graftedView.asDiscContents(source: "/dev/disk4").sessionCount, 1, "没传段数就按内容里用到的段数")
     expectEqual(tree.source, "/dev/disk4", "来源")
     expectEqual(tree.volumeName, "TEST", "卷标")
     let folder = tree.entries.first

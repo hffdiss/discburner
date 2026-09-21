@@ -67,12 +67,17 @@ public extension DiscContentView {
     ///
     /// 系统只挂载多区段盘的其中一段，而这一份是按扇区读出来的**整盘**内容，
     /// 所以界面显示的和盘上真实的能对上——追加刻录最容易踩的就是这个坑。
+    ///
+    /// - Parameter sessionCount: 这张盘实际有几段。嫁接过的盘只读最后一段就够
+    ///   （`sessions` 里就只剩那一段），所以这个数得由调用方从驱动器的 TOC 传进来，
+    ///   否则界面会把 4 段盘写成「共 1 个区段」。
     func asDiscContents(
         source: String,
         media: MediaKind = .unknown,
         mediaID: String? = nil,
         volumeName: String? = nil,
-        fileSystem: String? = nil
+        fileSystem: String? = nil,
+        sessionCount: Int? = nil
     ) -> DiscContents {
         var isDirectory: [String: Bool] = [:]
         for directory in directories { isDirectory[directory] = true }
@@ -124,7 +129,7 @@ public extension DiscContentView {
         contents.mediaID = mediaID
         contents.volumeName = volumeName
         contents.fileSystem = fileSystem
-        contents.sessionCount = sessions.count
+        contents.sessionCount = sessionCount ?? sessions.count
         contents.entries = entries(under: "")
         contents.fileCount = files.count
         contents.directoryCount = isDirectory.values.filter { $0 }.count

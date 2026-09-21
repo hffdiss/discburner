@@ -149,8 +149,8 @@ struct DiscBrowserPanel: View {
     private var content: some View {
         if let contents = displayContents, !contents.entries.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
-                if showingWholeDisc {
-                    Text("这张盘共有 \(contents.sessionCount ?? 1) 个区段；下面是按扇区读出来的整盘内容（含全部区段），不是系统挂载的那一段。")
+                if showingWholeDisc, let sessions = contents.sessionCount, sessions > 1 {
+                    Text("这张盘共有 \(sessions) 个区段；下面是按扇区读出来的整盘内容（含全部区段），不是系统挂载的那一段。")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

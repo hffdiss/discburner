@@ -609,7 +609,12 @@ final class AppModel: ObservableObject {
         discWholeContentLoading = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let whole = DiscContentReader.read(deviceNode: device, layout: layout)?
-                .asDiscContents(source: device, media: media, mediaID: mediaID)
+                .asDiscContents(
+                    source: device,
+                    media: media,
+                    mediaID: mediaID,
+                    sessionCount: layout.recordedSessions
+                )
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.discWholeContentLoading = false

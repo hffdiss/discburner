@@ -72,6 +72,11 @@ struct DiscContentsView: View {
         return model.discContents
     }
 
+    /// 现在显示的是不是按扇区读出来的完整内容（而不是系统挂载的那一段）。
+    private var showingWholeDisc: Bool {
+        model.discWholeContent?.entries.isEmpty == false
+    }
+
     private var content: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -81,8 +86,7 @@ struct DiscContentsView: View {
                         .foregroundColor(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if model.discWholeContent?.entries.isEmpty == false,
-                   let sessions = model.discWholeContent?.sessionCount, sessions > 1 {
+                if showingWholeDisc, let sessions = displayContents?.sessionCount, sessions > 1 {
                     Text("这是按扇区读出来的整盘内容（含全部 \(sessions) 个区段）。"
                         + "macOS / Linux 的系统挂载默认只看得到第一段，所以磁盘工具 / 访达里看到的内容可能比这里少。")
                         .font(.system(size: 11))

@@ -47,7 +47,7 @@ open dist/DiscBurner.app   # 打开图形界面
 命令行工具在 `.build-manual/universal/discburn`，可以先自检：
 
 ```bash
-./.build-manual/universal/discburn-selftest   # 406 项单元/集成自检
+./.build-manual/universal/discburn-selftest   # 408 项单元/集成自检
 ```
 
 ## 安装与分发
@@ -118,7 +118,7 @@ VERSION=1.2.3 ./build.sh      # 临时指定版本号（不改 VERSION 文件）
 
 1. 检查工作区是否干净、这个 tag 有没有用过、GitHub 凭据能不能访问仓库
 2. 用新版本号跑 `./build.sh`（产物是 `dist/DiscBurner-<版本>.dmg` / `.zip`）
-3. 跑 406 项自检，不过不发版
+3. 跑 408 项自检，不过不发版
 4. 把版本号写回 `VERSION`、提交、打 `vX.Y.Z` tag 并推送（`main` 由 post-commit 钩子推）
 5. 调 GitHub API 建 Release，把 `.dmg` 和 `.zip` 作为附件传上去
 
@@ -572,7 +572,7 @@ docker run --rm --privileged -v /tmp:/host node:22-slim bash -c '
 - 刻录速度建议：按介质给稳妥档（这台盘是 DVD+R → 推荐 8x，并写明「驱动器没有上报倍速，按常用值取 8x」），
   下拉框可改「自动」或 1x / 2x / 3x / 4x / 6x / 8x / 16x / 24x / 48x；说明行会随选择变（换档后提示「手动指定 8x，约 45 秒」）；预计耗时按内容大小换算
 - `hdiutil makehybrid` 生成映像、`drutil burn` 真实写盘、`drutil erase/eject` 参数拼装
-- 命令行与图形界面均能构建、运行；406 项自检全部通过（含速度建议、常用档位与耗时换算三组）
+- 命令行与图形界面均能构建、运行；408 项自检全部通过（含速度建议、常用档位与耗时换算三组）
 - 通用二进制（x86_64 + arm64）、App 包结构、ad-hoc 签名校验、DMG 挂载后直接运行
 - 光盘写满/被关闭后 `Writability` 字段为空的情况（改用 `discinfo` 的 Disc Status 判断，不再误报「状态未知」）
 - **真实刻录**：同一张 DVD+R 上连续追加 7 段全部成功（含最后两次从图形界面点「开始刻录」的完整流程），
