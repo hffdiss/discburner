@@ -44,6 +44,7 @@ func usage() {
       discburn status [--drive N]           查看当前介质详情
       discburn contents [--drive N]         读取光盘里已有的内容
       discburn contents --image <映像>      读取光盘映像里的内容
+      discburn contents --export <目录>     把光盘里已有的内容（含全部区段）导出到目录
       discburn history [--limit N]          本机刻录记录
       discburn plan <路径…> [--name 卷标]    估算大小与所需介质，不写盘
       discburn check <路径…> [--json]       兼容性预检（Windows / Linux / 老设备）
@@ -109,6 +110,8 @@ struct Options {
     /// 刻录倍速：默认「推荐」（按介质与驱动器能力取稳妥值）。
     var speedMode: SpeedMode = .recommended
     var outputURL: URL?
+    /// `contents --export <目录>`：把盘上内容导出到这个目录。
+    var exportURL: URL?
     var assumeYes = false
     var limit = 10
     /// 自动重命名不兼容的文件名后再刻。
@@ -202,6 +205,9 @@ func parse(_ arguments: [String]) throws -> Options {
         case "-o", "--output", "--image":
             let value = try nextValue(argument)
             options.outputURL = URL(fileURLWithPath: (value as NSString).expandingTildeInPath)
+        case "--export":
+            let value = try nextValue(argument)
+            options.exportURL = URL(fileURLWithPath: (value as NSString).expandingTildeInPath)
         case "--no-verify":
             options.verify = false
         case "--verify":
@@ -719,9 +725,22 @@ func currentSpeedAdvice(_ options: Options, payloadBytes: Int64 = 0) -> SpeedAdv
 /// 读取光盘（或映像文件）里已有的内容。
 func commandContents(options: Options) throws {
     var contents: DiscContents
+    // 按扇区读出来的原始整盘内容 + 对应的读盘通道，导出时要用。
+    var raw: DiscContentView?
+    var reader: IsoImageReader?
+    var source = "光盘"
     if let image = options.outputURL {
         print(bold("[读取映像] ") + image.path)
-        contents = try DiscReader.readImage(image)
+        source = image.path
+        raw = IsoImageReader(fileURL: image).flatMap {
+            DiscContentReader.read(reader: $0, layout: DiscLayout.singleSession)
+        }
+        if let whole = raw, let imageReader = IsoImageReader(fileURL: image) {
+            reader = imageReader
+            contents = whole.asDiscContents(source: source, sessionCount: 1)
+        } else {
+            contents = try DiscReader.readImage(image)
+        }
     } else {
         let drives = try DriveService.listDrives()
         guard let drive = options.driveIndex.flatMap({ index in drives.first { $0.index == index } }) ?? drives.first else {
@@ -733,11 +752,14 @@ func commandContents(options: Options) throws {
             throw BurnError.unexpected("系统没有报告光盘设备节点")
         }
         print(bold("[读取光盘] ") + "\(device)  \(status.media.displayName)")
+        source = device
         // 优先按扇区读「整盘内容」：多区段盘系统只挂载其中一段，
         // 只看挂载结果会少显示内容——「追加刻录后看不到文件」最容易踩的就是这个坑。
         let layout = (try? Multisession.layout(driveIndex: drive.index)) ?? .empty
         if !layout.isEmpty,
            let whole = DiscContentReader.read(deviceNode: device, layout: layout) {
+            raw = whole
+            reader = IsoImageReader(deviceNode: device)
             contents = whole.asDiscContents(
                 source: device,
                 media: status.media,
@@ -793,6 +815,33 @@ func commandContents(options: Options) throws {
             }
             print(line)
         }
+    }
+
+    // 访达 / 资源管理器里的那个卷是「系统挂载」的结果，多区段盘上系统只挂第一段，
+    // 所以要把盘上真正的内容落到本机，只能自己按扇区读出来写一遍。
+    if let exportURL = options.exportURL {
+        guard let raw = raw, !raw.isEmpty, let reader = reader else {
+            throw UsageError(message: "没读到可导出的内容（这张盘可能是空白的，或者区段读不出来）。")
+        }
+        print("")
+        print(bold("[导出] ") + exportURL.path)
+        var lastStep = -1
+        let summary = try DiscContentReader.extract(
+            raw,
+            reader: reader,
+            source: source,
+            to: exportURL,
+            conflict: .skipExisting
+        ) { fraction in
+            guard !options.quiet else { return }
+            let step = Int(fraction * 10)
+            if step != lastStep {
+                lastStep = step
+                print("  \(Int(fraction * 100))%")
+            }
+        }
+        print("  \(summary.description)")
+        print("  已导出到 \(exportURL.path)")
     }
 }
 

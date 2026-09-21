@@ -68,6 +68,11 @@ public final class IsoImageReader {
     }
 
     /// 从第 `extent` 个扇区开始读 `size` 个字节。
+    ///
+    /// 光驱对应的 `/dev/rdiskN` 只接受**扇区整数倍**的读取长度：实测要 18 个字节、
+    /// 1000 个字节都直接报错（`read` 返回 EINVAL），2048 / 1 MiB 就正常。
+    /// 所以读盘时一律把长度向上取整到扇区边界，读完再截断。
+    /// 文件映像走同一条路也不会读坏：末尾不足一个扇区时拿到多少算多少。
     public func read(extent: Int, size: Int) -> Data? {
         guard extent >= 0, size > 0 else { return nil }
         let offset = (extent - baseSector) * Self.sectorSize
@@ -77,13 +82,22 @@ public final class IsoImageReader {
             return data.subdata(in: offset..<(offset + size))
         }
         guard let handle = handle else { return nil }
+        let aligned = ((size + Self.sectorSize - 1) / Self.sectorSize) * Self.sectorSize
+        var collected = Data()
+        var remaining = aligned
         do {
             try handle.seek(toOffset: UInt64(offset))
-            guard let chunk = try handle.read(upToCount: size), chunk.count == size else { return nil }
-            return chunk
+            // 设备短读是正常现象，攒够为止；读到 0 字节说明到底了。
+            while remaining > 0 {
+                guard let chunk = try handle.read(upToCount: remaining), !chunk.isEmpty else { break }
+                collected.append(chunk)
+                remaining -= chunk.count
+            }
         } catch {
             return nil
         }
+        guard collected.count >= size else { return nil }
+        return collected.prefix(size)
     }
 }
 

@@ -74,6 +74,10 @@
   擦盘 → 单段刻完。一次性介质（DVD+R/-R）擦不掉，只能追加，界面要如实说明 macOS / Linux 只看得到第一段。
 - **`DiscContentReader` 是「整盘内容」的唯一来源**：界面（左栏 / 查看光盘内容）都走它按扇区读，
   不要退回 `DiscReader`（那条路依赖系统挂载，只会给你一段）。
+- **`/dev/rdiskN` 只接受扇区整数倍的读取长度**：实测要 18 / 1000 个字节直接报错
+  （`read` 返回 EINVAL，Foundation 报成 The file couldn't be opened），2048 / 1 MiB 正常。
+  `IsoImageReader.read` 一律把长度向上取整到扇区边界再截断，别改回「要多少读多少」——
+  否则导出小文件、以及合并重刻时读旧文件都会失败。
 
 ## 看界面的正确姿势
 

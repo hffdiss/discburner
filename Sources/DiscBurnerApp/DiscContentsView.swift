@@ -88,7 +88,8 @@ struct DiscContentsView: View {
                 }
                 if showingWholeDisc, let sessions = displayContents?.sessionCount, sessions > 1 {
                     Text("这是按扇区读出来的整盘内容（含全部 \(sessions) 个区段）。"
-                        + "macOS / Linux 的系统挂载默认只看得到第一段，所以磁盘工具 / 访达里看到的内容可能比这里少。")
+                        + "macOS / Linux 的系统挂载默认只看得到第一段，所以磁盘工具 / 访达里看到的内容比这里少——"
+                        + "要把这些文件落到本机，点下面的「导出到文件夹…」。")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -180,7 +181,13 @@ struct DiscContentsView: View {
 
     private var footer: some View {
         HStack {
-            if let url = BurnHistory.fileURL {
+            if let message = model.discExportMessage {
+                ProgressView(value: model.discExportProgress ?? 0)
+                    .frame(width: 90)
+                Text(message)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            } else if let url = BurnHistory.fileURL {
                 Text("记录保存在 \(url.path)")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
@@ -188,6 +195,13 @@ struct DiscContentsView: View {
                     .truncationMode(.middle)
             }
             Spacer()
+            Button {
+                model.chooseFolderAndExportDiscContents()
+            } label: {
+                Label("导出到文件夹…", systemImage: "square.and.arrow.down")
+            }
+            .disabled(!model.canExportDiscContents)
+            .help("把盘上全部区段的内容拷到本机文件夹，导出后在访达里选中（访达里的那个卷只有第一段）")
             Button("关闭") { presentationMode.wrappedValue.dismiss() }
                 .keyboardShortcut(.escape, modifiers: [])
         }

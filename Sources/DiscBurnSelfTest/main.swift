@@ -1686,6 +1686,34 @@ run("整盘合并重刻：旧盘内容 + 这次新加的合成一份，单段刻
     )
 }
 
+run("按扇区读：不到一个扇区的小文件也要读全（光驱只收扇区整数倍）") {
+    let folder = try makeTempDirectory("reader")
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    // 造一个末尾不足一个扇区的映像：读第 3 扇区时只能拿到 100 字节，
+    // 光驱对应的 /dev/rdiskN 上这种「要 60 个字节」的请求必须自己按扇区取再截断。
+    var bytes = [UInt8](repeating: 0x41, count: 2048 * 3 + 100)
+    for index in 0..<18 { bytes[index] = UInt8(0x30 + index) }
+    let url = folder.appendingPathComponent("小.iso")
+    try Data(bytes).write(to: url)
+    guard let reader = IsoImageReader(fileURL: url) else {
+        expect(false, "应该能打开文件映像")
+        return
+    }
+
+    expectEqual(reader.read(extent: 0, size: 18)?.count, 18, "18 个字节也要读全（按扇区读再截断）")
+    expectEqual(reader.read(extent: 0, size: 18)?.first, 0x30, "内容从第 0 字节开始")
+    expectEqual(reader.read(extent: 1, size: 5)?.count, 5, "从扇区中间起的短读")
+    expectEqual(reader.read(extent: 3, size: 60)?.count, 60, "末尾只剩 100 字节时也要读够")
+    expectEqual(reader.read(extent: 0, size: 2048)?.count, 2048, "整扇区读取不受影响")
+    expectNil(reader.read(extent: 3, size: 500), "超出映像末尾要返回 nil")
+
+    // 内存映像这条路也保持逐字节精确。
+    let memory = IsoImageReader(data: Data(bytes))
+    expectEqual(memory.read(extent: 0, size: 18)?.count, 18, "内存映像读 18 个字节")
+    expectNil(memory.read(extent: 0, size: 0), "要 0 个字节不算有效读取")
+}
+
 run("追加策略：默认是嫁接，合并重刻要显式选") {
     expectEqual(BurnOptions().appendStrategy, .graft, "默认嫁接（写得快，但 macOS / Linux 只看得到第一段）")
     expectEqual(BurnOptions(appendStrategy: .rewriteMerged).appendStrategy, .rewriteMerged, "可以选合并重刻")

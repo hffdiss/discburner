@@ -102,6 +102,16 @@ struct DiscBrowserPanel: View {
             .help("在独立窗口里打开（⌘I）")
 
             Button {
+                model.chooseFolderAndExportDiscContents()
+            } label: {
+                Image(systemName: "square.and.arrow.down")
+            }
+            .buttonStyle(PlainButtonStyle())
+            .foregroundColor(.accentColor)
+            .help("把盘上内容导出到文件夹…（访达里只能看到系统挂载的那一段）")
+            .disabled(!model.canExportDiscContents)
+
+            Button {
                 model.showDiscBrowser.toggle()
             } label: {
                 Image(systemName: model.showDiscBrowser ? "chevron.up" : "chevron.down")

@@ -50,6 +50,12 @@ public struct DiscLayout: Equatable {
 
     public static let empty = DiscLayout()
 
+    /// 一张普通的单段盘 / 一个单段映像：内容从第 0 扇区开始。
+    /// 用来按扇区读 `.iso` 这类映像里的内容。
+    public static var singleSession: DiscLayout {
+        DiscLayout(sessionStarts: [0], nextWritableAddress: nil, recordedSessions: 1)
+    }
+
     public var lastSessionStart: Int? { sessionStarts.last }
     public var isEmpty: Bool { recordedSessions == 0 }
 

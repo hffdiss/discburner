@@ -120,6 +120,9 @@ final class AppModel: ObservableObject {
     /// 免得界面显示的内容和盘上真正有的内容对不上。读的是目录结构，不是文件内容，很快。
     @Published var discWholeContent: DiscContents?
     @Published var discWholeContentLoading = false
+    /// 导出盘上内容到文件夹的进度（0...1，nil 表示没在导出）。
+    @Published var discExportProgress: Double?
+    @Published var discExportMessage: String?
     @Published var discContentsLoading = false
     @Published var discContentsError: String?
     @Published var showDiscContents = false
@@ -601,6 +604,7 @@ final class AppModel: ObservableObject {
         guard status.isPresent, discWholeContentLoading == false else { return }
         guard let device = status.deviceNode, !device.isEmpty, !discLayout.isEmpty else {
             discWholeContent = nil
+            discWholeRaw = nil
             return
         }
         let media = status.media
@@ -608,17 +612,103 @@ final class AppModel: ObservableObject {
         let layout = discLayout
         discWholeContentLoading = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let whole = DiscContentReader.read(deviceNode: device, layout: layout)?
-                .asDiscContents(
-                    source: device,
-                    media: media,
-                    mediaID: mediaID,
-                    sessionCount: layout.recordedSessions
-                )
+            let raw = DiscContentReader.read(deviceNode: device, layout: layout)
+            let whole = raw?.asDiscContents(
+                source: device,
+                media: media,
+                mediaID: mediaID,
+                sessionCount: layout.recordedSessions
+            )
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.discWholeContentLoading = false
+                self.discWholeRaw = raw
                 self.discWholeContent = (whole?.entries.isEmpty == false) ? whole : nil
+            }
+        }
+    }
+
+    /// 导出时用的原始整盘内容（包含每个文件在盘上的扇区地址）。
+    private var discWholeRaw: DiscContentView?
+
+    /// 盘上内容能不能导出（读到了内容、而且没在刻录 / 导出）。
+    var canExportDiscContents: Bool {
+        discWholeRaw?.isEmpty == false && !isBusy && discExportProgress == nil
+    }
+
+    /// 弹「选择文件夹」，然后导出盘上内容。
+    func chooseFolderAndExportDiscContents() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "导出到这里"
+        panel.message = "会新建一个以卷标命名的文件夹，把盘上全部区段的内容放进去（访达里的那个卷只有第一段）。"
+        if panel.runModal() == .OK, let url = panel.url {
+            exportDiscContents(to: url)
+        }
+    }
+
+    /// 把盘上已有的内容导出到一个文件夹，导出完在访达里选中它。
+    ///
+    /// 为什么需要这个：访达里的那个卷是**系统挂载**的结果，多区段盘上系统只挂第一段，
+    /// 所以「应用里看得到、访达里看不到」是必然的——要拿到文件就得自己按扇区读出来再落盘。
+    func exportDiscContents(to folder: URL) {
+        guard !isBusy else {
+            lastError = "正在刻录，等这一轮结束再导出。"
+            return
+        }
+        guard let device = status.deviceNode, !device.isEmpty else {
+            lastError = "没有可以读取的光盘设备。"
+            return
+        }
+        guard let content = discWholeRaw, !content.isEmpty else {
+            lastError = "还没读到盘上的内容，先点「重新读取」。"
+            return
+        }
+        guard discExportProgress == nil else { return }
+
+        // 导出到「以卷标命名的新文件夹」，别把用户选的位置弄乱。
+        let rawName = discContents?.volumeName ?? status.media.displayName
+        let base = ImageBuilder.normalizeVolumeName(rawName, fallback: "光盘内容")
+        var destination = folder.appendingPathComponent(base, isDirectory: true)
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: destination.path) {
+            destination = folder.appendingPathComponent("\(base) \(suffix)", isDirectory: true)
+            suffix += 1
+        }
+
+        discExportProgress = 0
+        discExportMessage = "正在导出 \(content.fileCount) 个文件…"
+        logLines.append("↓ 导出盘上内容到 \(destination.path)")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var failure: String?
+            var summary: DiscExtractSummary?
+            do {
+                summary = try DiscContentReader.extract(
+                    content,
+                    deviceNode: device,
+                    to: destination,
+                    conflict: .replace
+                ) { fraction in
+                    DispatchQueue.main.async { self?.discExportProgress = fraction }
+                }
+            } catch {
+                failure = error.localizedDescription
+            }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.discExportProgress = nil
+                self.discExportMessage = nil
+                if let failure = failure {
+                    self.lastError = "导出失败：\(failure)"
+                } else if let summary = summary {
+                    self.finishedMessage = "已把盘上内容导出到：\n\(destination.path)\n"
+                        + "\(summary.description)（含全部区段）"
+                    // 直接在访达里选中刚导出的文件夹——盘上那些文件在访达里本来就不显示。
+                    NSWorkspace.shared.activateFileViewerSelecting([destination])
+                }
             }
         }
     }
@@ -725,6 +815,11 @@ final class AppModel: ObservableObject {
 
     func run(request: BurnRequest) {
         guard !isBusy else { return }
+        // 导出和刻录都要独占读盘，别让两边同时动光驱。
+        guard discExportProgress == nil else {
+            lastError = "正在导出盘上内容，等导出结束再刻录。"
+            return
+        }
         isBusy = true
         phase = .checking
         taskFraction = 0
@@ -808,7 +903,7 @@ final class AppModel: ObservableObject {
     // MARK: - 擦除 / 弹出
 
     func eraseDisc(mode: EraseMode) {
-        guard let index = selectedDriveIndex, !isBusy else { return }
+        guard let index = selectedDriveIndex, !isBusy, discExportProgress == nil else { return }
         isBusy = true
         phase = .erasing
         taskFraction = nil
