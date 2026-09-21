@@ -13,6 +13,8 @@ public struct BurnRecord: Codable, Identifiable {
     public var fileCount: Int
     public var topLevelItems: [String]
     public var wasTestBurn: Bool
+    /// 这次用的文件系统（旧记录里没有这个字段）。
+    public var filesystem: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -24,7 +26,8 @@ public struct BurnRecord: Codable, Identifiable {
         payloadBytes: Int64,
         fileCount: Int,
         topLevelItems: [String],
-        wasTestBurn: Bool
+        wasTestBurn: Bool,
+        filesystem: String? = nil
     ) {
         self.id = id
         self.date = date
@@ -36,6 +39,7 @@ public struct BurnRecord: Codable, Identifiable {
         self.fileCount = fileCount
         self.topLevelItems = topLevelItems
         self.wasTestBurn = wasTestBurn
+        self.filesystem = filesystem
     }
 }
 

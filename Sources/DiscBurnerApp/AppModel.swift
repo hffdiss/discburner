@@ -14,7 +14,6 @@ struct FileItem: Identifiable, Hashable {
 
 enum FileSystemPreset: Int, CaseIterable, Identifiable {
     case universal
-    case isoOnly
     case udfOnly
 
     var id: Int { rawValue }
@@ -22,23 +21,20 @@ enum FileSystemPreset: Int, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .universal: return "通用数据光盘（推荐）"
-        case .isoOnly: return "ISO 9660 + Joliet"
         case .udfOnly: return "纯 UDF"
         }
     }
 
     var detail: String {
         switch self {
-        case .universal: return "ISO 9660 + Joliet + UDF 1.02，Windows / macOS / Linux / 车机都能读"
-        case .isoOnly: return "最老式兼容，适合老设备和部分车载音响"
-        case .udfOnly: return "适合大文件与超长中文名，部分老设备无法识别"
+        case .universal: return "ISO 9660 + Joliet + Rock Ridge：Windows / macOS / Linux / 车机都能读，支持追加"
+        case .udfOnly: return "UDF 1.02：适合超大文件与超长中文名，但不能追加（每次都得一次刻完）"
         }
     }
 
     var options: (includeISO: Bool, includeJoliet: Bool, includeUDF: Bool) {
         switch self {
         case .universal: return (true, true, true)
-        case .isoOnly: return (true, true, false)
         case .udfOnly: return (false, false, true)
         }
     }
@@ -100,6 +96,10 @@ final class AppModel: ObservableObject {
     @Published var selectedDriveIndex: Int?
     @Published var status: DiscStatus = DiscStatus()
     @Published var statusError: String?
+    /// 盘上已有区段的布局（追加刻录要靠它决定新段从哪开始写）。
+    @Published var discLayout: DiscLayout = .empty
+    /// 已有区段能不能被新段接上（旧版本刻的盘接不上）。
+    @Published var discChainState: DiscChainState = .unknown
 
     @Published var phase: JobPhase = .idle
     @Published var taskFraction: Double?
@@ -253,7 +253,50 @@ final class AppModel: ObservableObject {
         )
     }
 
-    var nameRules: NameRules { imageOptions.nameRules }
+    /// 这次会用哪套引擎：优先 xorriso（多区段嫁接 + 正确的 Joliet 中文名），
+    /// 没装就退到 mkisofs，「纯 UDF」预设只能用系统自带工具。
+    var imageEngine: DataImageEngine { DataImageEngine.preferred(for: imageOptions) }
+
+    /// 命名规则必须和真正用的引擎一致（预检、自动重命名、刻进去的名字）。
+    var nameRules: NameRules { imageEngine.nameRules(for: imageOptions) }
+
+    /// 「刻录选项」里显示的文件系统。
+    var filesystemSummary: String {
+        "\(imageEngine.localizedSummary)（\(imageEngine.toolName)）"
+    }
+
+    enum BurnNoticeLevel { case info, warning, error }
+
+    /// 追加刻录这一行的说明：会不会合并旧内容、缺不缺工具、旧盘兼不兼容。
+    var appendNotice: (text: String, level: BurnNoticeLevel)? {
+        guard status.isPresent, let sessions = status.sessions, sessions > 0, status.canBurn else { return nil }
+        if closeDisc {
+            return ("这次会关闭光盘：刻完之后不能再往这张盘里加内容。", .info)
+        }
+        if discLayout.isEmpty {
+            return ("盘上已经有 \(sessions) 段内容，但读不到区段信息，现在无法追加。", .warning)
+        }
+        if discChainState == .broken {
+            return (
+                "这张盘是用旧版本刻的（每段各自独立寻址），追加后旧段内容在 Windows / Linux 上看不到；建议换一张空盘。",
+                .error
+            )
+        }
+        if imageEngine == .makehybrid {
+            return ("追加刻录需要 xorriso（终端执行 \(Xorriso.installHint)）：系统自带的工具不会把新段嫁接给旧段。", .warning)
+        }
+        if imageEngine == .mkisofs {
+            return (
+                "能追加，但 mkisofs 的 Joliet 名字转换只保留前 8 个字符，长中文名在 Windows 上会缺字；"
+                    + "执行 \(Mkisofs.recommendedTool) 换成 xorriso 就好了。",
+                .warning
+            )
+        }
+        return (
+            "追加模式：新内容接在第 \(discLayout.recordedSessions + 1) 段，合并盘上已有 \(discLayout.recordedSessions) 段内容。",
+            .info
+        )
+    }
 
     /// 当前介质 + 驱动器能力 + 内容大小给出的速度建议。
     var speedAdvice: SpeedAdvice {
@@ -405,12 +448,20 @@ final class AppModel: ObservableObject {
             var status = DiscStatus()
             var failure: String?
             var effectiveIndex: Int?
+            var layout = DiscLayout.empty
+            var chain = DiscChainState.unknown
             do {
                 drives = try DriveService.listDrives()
                 let index = drives.contains(where: { $0.index == preferred }) ? preferred : drives.first?.index
                 effectiveIndex = index
                 if let index = index {
                     status = try DriveService.status(driveIndex: index)
+                    if status.isPresent, (status.sessions ?? 0) > 0 {
+                        layout = (try? Multisession.layout(driveIndex: index)) ?? .empty
+                        if let device = status.deviceNode, !layout.isEmpty {
+                            chain = Multisession.chainState(deviceNode: device, layout: layout)
+                        }
+                    }
                 }
             } catch {
                 failure = error.localizedDescription
@@ -421,6 +472,8 @@ final class AppModel: ObservableObject {
                 self.drives = drives
                 self.selectedDriveIndex = effectiveIndex
                 self.status = status
+                self.discLayout = layout
+                self.discChainState = chain
                 self.statusError = failure
                 self.autoRefreshDiscContentsIfNeeded()
             }

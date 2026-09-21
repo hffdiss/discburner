@@ -253,6 +253,10 @@ public enum BurnError: LocalizedError {
     case capacityExceeded(required: Int64, available: Int64)
     case notRewritable(String)
     case noItems
+    /// 盘上已经有内容、需要多区段嫁接，但机器上没有能做嫁接的映像工具。
+    case appendNeedsIsoTool
+    /// 盘是用旧版本刻的（每段各自独立寻址），接上去只会让旧内容消失。
+    case appendIncompatibleDisc(sessions: Int)
     case unexpected(String)
 
     public var errorDescription: String? {
@@ -271,6 +275,14 @@ public enum BurnError: LocalizedError {
             return "当前介质（\(media)）不支持擦除，只有 CD-RW / DVD-RW / DVD+RW / DVD-RAM / BD-RE 可以擦除。"
         case .noItems:
             return "还没有选择要刻录的文件。"
+        case .appendNeedsIsoTool:
+            return "追加刻录要把新内容嫁接在旧区段后面（系统自带的 hdiutil 做不到这件事）。\n"
+                + "先在终端执行 `brew install xorriso`（已经装了 cdrtools 的话 `\(Mkisofs.recommendedTool)` 更好）再试；"
+                + "或者换一张空盘，把内容一次刻完。"
+        case .appendIncompatibleDisc(let sessions):
+            return "这张盘上已有的 \(sessions) 段是用旧版本 DiscBurner 刻的：每段各自独立寻址，"
+                + "Windows / Linux 本来就打不开旧内容。\n继续追加只会让旧段在新段里消失，所以先停下来了。"
+                + "建议换一张空盘重刻；旧盘上的内容可以在 Mac 上读出来先备份。"
         case .unexpected(let message):
             return message
         }

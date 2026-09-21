@@ -309,6 +309,9 @@ struct ContentView: View {
                     Text(model.preset.detail)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
+                    Text("实际写入：\(model.filesystemSummary)")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
 
                     Toggle("剔除 .DS_Store 等 macOS 垃圾文件", isOn: $model.excludeJunk)
                         .disabled(model.isBusy)
@@ -345,6 +348,13 @@ struct ContentView: View {
                         .font(.system(size: 10))
                         .foregroundColor(model.speedExplanationIsWarning ? .orange : .secondary)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    if let notice = model.appendNotice {
+                        Text(notice.text)
+                            .font(.system(size: 10))
+                            .foregroundColor(noticeColor(notice.level))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 section("介质") {
@@ -510,6 +520,15 @@ struct ContentView: View {
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color(NSColor.textBackgroundColor)))
+    }
+
+    /// 「追加刻录」那行提示的颜色：普通说明用次级色，警告橙、错误红。
+    private func noticeColor(_ level: AppModel.BurnNoticeLevel) -> Color {
+        switch level {
+        case .info: return .secondary
+        case .warning: return .orange
+        case .error: return .red
+        }
     }
 
     // MARK: - 底部状态栏

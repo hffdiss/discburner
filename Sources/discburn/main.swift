@@ -297,6 +297,42 @@ func commandStatus(options: Options) throws {
         print("  可用倍速：\(status.writeSpeeds.map { "\($0)x" }.joined(separator: ", "))")
     }
     print("  可擦除：  \(status.erasable || status.media.isRewritable ? "是" : "否")")
+    // 多区段盘：把段起始和「下一个可写地址」也打出来，方便核对追加会不会写对地方。
+    if (status.sessions ?? 0) > 0, let layout = try? Multisession.layout(driveIndex: drive.index), !layout.isEmpty {
+        let starts = layout.sessionStarts.prefix(6).map(String.init).joined(separator: ", ")
+        let more = layout.sessionStarts.count > 6 ? " …" : ""
+        print("  段起始扇区：\(starts)\(more)（共 \(layout.recordedSessions) 段）")
+        if let next = layout.nextWritableAddress {
+            print("  下一段起始：\(next)（扇区）")
+        }
+        if let device = status.deviceNode {
+            let chain = Multisession.chainState(deviceNode: device, layout: layout)
+            print("  旧段可合并：\(chain.localizedDescription)")
+            // 最后一段的 Joliet 视图就是 Windows 会看到的那一套（macOS 自己读的是 Rock Ridge）。
+            if let start = layout.lastSessionStart,
+               let reader = IsoImageReader(deviceNode: device),
+               IsoTree.rootRecord(in: reader, imageStart: start, joliet: true) != nil {
+                let entries = IsoTree.entries(in: reader, imageStart: start).filter { $0.isJoliet }
+                let files = entries.filter { !$0.isDirectory }
+                let folders = entries.filter { $0.isDirectory }
+                let sample = files.prefix(3).map { $0.name }.joined(separator: "、")
+                print("  最后一段目录树：\(files.count) 个文件、\(folders.count) 个文件夹"
+                    + (sample.isEmpty ? "" : "（Windows 视角，如 \(sample)）"))
+            }
+        }
+    }
+    // 追加刻录要靠 xorriso（首选）或 mkisofs 把新段嫁接给旧段，这里把能不能用得说清楚。
+    let appendEngine = DataImageEngine.preferred(for: makeImageOptions(options))
+    if appendEngine.supportsMultisessionAppend {
+        let version = (appendEngine == .xorriso ? Xorriso.version() : Mkisofs.version())?
+            .components(separatedBy: " : ").first
+        print("  多区段追加：可用（\(appendEngine.toolName)\(version.map { " · \($0)" } ?? "")）")
+        if appendEngine == .mkisofs {
+            print("  ⚠︎ mkisofs 写 Joliet 中文长名只保留前 8 个字符，建议 \(Mkisofs.recommendedTool)")
+        }
+    } else {
+        print("  多区段追加：不可用，需要 \(Xorriso.installHint)")
+    }
 }
 
 func makeImageOptions(_ options: Options) -> ImageOptions {
@@ -409,7 +445,7 @@ func commandCheck(options: Options) throws {
         : (report.hasWarningsOrErrors ? yellow("⚠ \(report.headline)") : green("✔ \(report.headline)"))
     print(bold("[兼容性预检] ") + headline)
     print("  \(report.fileCount) 个文件 / \(report.directoryCount) 个目录，最深 \(report.maxDepth) 层")
-    print("  目标文件系统：\(imageOptions.localizedSummary)")
+    print("  目标文件系统：\(DataImageEngine.preferred(for: imageOptions).localizedSummary)")
     printCompatibilityReport(report)
     printRenamePlan(report)
     if report.renamePlan.isEmpty {
@@ -546,7 +582,11 @@ func runPlanOnly(_ options: Options) throws {
         options: StageOptions(excludeJunkFiles: !options.keepJunk)
     )
     let payload = entries.reduce(Int64(0)) { $0 + $1.byteCount }
-    let estimated = (try? ImageBuilder.estimateSize(source: workspace.staging, options: imageOptions)) ?? payload
+    let engine = DataImageEngine.preferred(for: imageOptions)
+    var estimated = payload
+    if let printed = try? engine.estimatedBytes(source: workspace.staging, options: imageOptions, graft: nil), printed > 0 {
+        estimated = printed
+    }
 
     print("")
     print(bold("待刻录内容"))
@@ -555,7 +595,7 @@ func runPlanOnly(_ options: Options) throws {
     }
     print("  合计：\(ByteText.human(payload))（\(ByteText.decimal(payload))）")
     print("  光盘映像预计：\(ByteText.human(estimated))")
-    print("  卷标：\(imageOptions.volumeName)   文件系统：\(imageOptions.localizedSummary)")
+    print("  卷标：\(imageOptions.volumeName)   文件系统：\(engine.localizedSummary)（\(engine.toolName)）")
     let speed = resolveSpeed(options)
     var speedLine = speed.note
     if let value = speed.speed {

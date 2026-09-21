@@ -927,6 +927,449 @@ run("调用 hdiutil 生成并检查光盘映像") {
     expect(info.output.contains("UDF"), "应包含 UDF")
 }
 
+// MARK: - 多区段追加
+
+/// 自检专用：把整盘字节交给正式的 `IsoTree` 解析（和嫁接用到的是同一套代码）。
+func discEntries(inDisc bytes: [UInt8], sessionStart: Int) -> [IsoDirectoryEntry] {
+    let reader = IsoImageReader(data: Data(bytes), baseSector: 0)
+    return IsoTree.entries(in: reader, imageStart: sessionStart)
+}
+
+/// 自检专用：这次会用的、能做多区段嫁接的引擎（没装工具时返回 nil）。
+func graftEngine() -> DataImageEngine? {
+    let engine = DataImageEngine.preferred(for: ImageOptions(volumeName: "自检"))
+    guard engine.supportsMultisessionAppend else { return nil }
+    return engine
+}
+
+/// 自检专用：用正式引擎生成一段映像。
+func buildSession(source: URL, output: URL, volumeName: String, graft: AppendTarget?) throws {
+    let engine = graftEngine() ?? .xorriso
+    try engine.buildImage(
+        source: source,
+        outputURL: output,
+        options: ImageOptions(volumeName: volumeName),
+        graft: graft
+    )
+}
+
+let trackInfoSample = """
+   Vendor   Product           Rev
+ PIONEER  DVD-RW DVR-XU01C  DL61
+
+  Track 1 info:
+               dataLength: 46
+              trackNumber: 1
+            sessionNumber: 1
+                    blank: false
+        trackStartAddress: 0
+      nextWritableAddress: 0 (not valid)
+                trackSize: 544
+
+  Track 2 info:
+               dataLength: 46
+              trackNumber: 2
+            sessionNumber: 2
+                    blank: false
+        trackStartAddress: 2592
+      nextWritableAddress: 0 (not valid)
+                trackSize: 544
+
+  Track 3 info:
+               dataLength: 46
+              trackNumber: 3
+            sessionNumber: 3
+                    blank: true
+        trackStartAddress: 546880
+      nextWritableAddress: 546880 (valid)
+                trackSize: 1748224
+"""
+
+run("解析 drutil trackinfo（段起始 / 下一个可写地址）") {
+    let layout = DiscLayout.parse(trackInfo: trackInfoSample)
+    expectEqual(layout.tracks.count, 3, "轨道数")
+    expectEqual(layout.recordedSessions, 2, "已有内容的段数（带数据的轨道）")
+    expectEqual(layout.sessionStarts, [0, 2592], "段起始扇区")
+    expectEqual(layout.lastSessionStart, 2592, "最后一段起始")
+    expectEqual(layout.nextWritableAddress, 546880, "下一个可写地址")
+    expect(!layout.isEmpty, "有内容的盘不算空盘")
+    expect(DiscLayout.parse(trackInfo: "").isEmpty, "没有输出按空盘处理")
+    expect(DiscLayout.parse(trackInfo: "  Track 1 info:\n     blank: true\n  nextWritableAddress: 0 (valid)\n").isEmpty, "纯空白盘没有已写段")
+}
+
+run("追加目标：空盘 / 擦盘 / 缺设备节点") {
+    let layout = DiscLayout.parse(trackInfo: trackInfoSample)
+    var status = DiscStatus()
+    status.isPresent = true
+    status.deviceNode = "/dev/disk2"
+    let target = try Multisession.appendTarget(status: status, layout: layout, eraseFirst: false)
+    expectEqual(target?.devicePath, "/dev/disk2", "嫁接设备")
+    expectEqual(target?.lastSessionStart, 2592, "上段起始扇区")
+    expectEqual(target?.nextWritableAddress, 546880, "下段起始扇区")
+    expectNil(try Multisession.appendTarget(status: status, layout: layout, eraseFirst: true), "要擦盘就不嫁接")
+    expectNil(try Multisession.appendTarget(status: status, layout: .empty, eraseFirst: false), "空盘不嫁接")
+
+    var noDevice = status
+    noDevice.deviceNode = nil
+    var threw = false
+    do {
+        _ = try Multisession.appendTarget(status: noDevice, layout: layout, eraseFirst: false)
+    } catch {
+        threw = true
+    }
+    expect(threw, "拿不到设备节点时要报错，而不是刻出读不了的盘")
+}
+
+run("识别旧版本刻的盘（区段相对寻址）") {
+    let folder = try makeTempDirectory("chain")
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    func makeDisc(rootSector: Int) throws -> (URL, DiscLayout) {
+        let sessionStart = 2592
+        var bytes = [UInt8](repeating: 0, count: (sessionStart + 32) * 2048)
+        let pvd = (sessionStart + 16) * 2048
+        bytes[pvd + 1] = 0x43; bytes[pvd + 2] = 0x44; bytes[pvd + 3] = 0x30; bytes[pvd + 4] = 0x30; bytes[pvd + 5] = 0x31
+        bytes[pvd + 158] = UInt8(rootSector & 0xFF)
+        bytes[pvd + 159] = UInt8((rootSector >> 8) & 0xFF)
+        let url = folder.appendingPathComponent("disc-\(rootSector).iso")
+        try Data(bytes).write(to: url)
+        let layout = DiscLayout(
+            tracks: [DiscTrack(trackNumber: 1, sessionNumber: 1, startAddress: sessionStart, nextWritableAddress: nil, trackSize: 544)],
+            sessionStarts: [sessionStart],
+            nextWritableAddress: sessionStart + 4096,
+            recordedSessions: 1
+        )
+        return (url, layout)
+    }
+
+    let broken = try makeDisc(rootSector: 41)
+    expectEqual(
+        Multisession.chainState(deviceNode: broken.0.path, layout: broken.1),
+        .broken,
+        "根目录写着区段相对地址的盘应判为不可嫁接"
+    )
+    let standard = try makeDisc(rootSector: 2592 + 30)
+    expectEqual(
+        Multisession.chainState(deviceNode: standard.0.path, layout: standard.1),
+        .complete,
+        "根目录落在本段内的盘应判为可嫁接"
+    )
+    expectEqual(Multisession.chainState(deviceNode: "/dev/不存在的盘", layout: standard.1), .unknown, "读不到盘时返回未知")
+
+    var descriptor = [UInt8](repeating: 0, count: 2048)
+    descriptor[1] = 0x43; descriptor[2] = 0x44; descriptor[3] = 0x30; descriptor[4] = 0x30; descriptor[5] = 0x31
+    descriptor[158] = 41
+    expectEqual(RawDisc.rootDirectorySector(inVolumeDescriptor: Data(descriptor)), 41, "卷描述符里的根目录扇区")
+    expectNil(RawDisc.rootDirectorySector(inVolumeDescriptor: Data(repeating: 0, count: 2048)), "不是卷描述符")
+    expectEqual(RawDisc.littleEndian32(Data([0x2A, 0x00, 0x00, 0x00])), 42, "小端 32 位")
+    expectEqual(RawDisc.rawPath(for: "/dev/disk9"), "/dev/disk9", "不存在的原始设备回退到原路径")
+}
+
+run("xorriso 参数与 -print-size 解析") {
+    let source = URL(fileURLWithPath: "/tmp/待刻内容")
+    let output = URL(fileURLWithPath: "/tmp/out.iso")
+    let plain = Xorriso.arguments(source: source, outputURL: output, volumeName: "DATA", graft: nil)
+    expectEqual(plain.first, "-as", "走 xorriso 的 mkisofs 仿真模式")
+    expectEqual(plain.dropFirst().first, "mkisofs", "仿真参数紧随其后")
+    if let charset = plain.firstIndex(of: "-input-charset"), charset + 1 < plain.count {
+        expectEqual(plain[charset + 1], "UTF-8", "文件名按 UTF-8 解释（否则 Windows 上的中文名是乱码）")
+    } else {
+        expect(false, "缺少 -input-charset，中文名会在 Joliet 里变成乱码")
+    }
+    expect(plain.contains("-J"), "普通段带 Joliet")
+    expect(plain.contains("-R"), "普通段带 Rock Ridge")
+    expect(plain.contains("-joliet-long"), "Joliet 名字放宽到 103 个字符")
+    expect(!plain.contains("-M"), "普通段不做嫁接")
+    expectEqual(plain.last, "/tmp/待刻内容", "源目录放在最后")
+    expectEqual(plain.firstIndex(of: "-V").flatMap { index in index + 1 < plain.count ? plain[index + 1] : nil }, "DATA", "卷标")
+
+    let device = AppendTarget(devicePath: "/dev/disk2", lastSessionStart: 2592, nextWritableAddress: 546880)
+    let merged = Xorriso.arguments(source: source, outputURL: output, volumeName: "DATA", graft: device)
+    expect(merged.contains("-M"), "嫁接段带 -M")
+    expect(merged.contains("stdio:/dev/disk2"), "光驱要写成 stdio: 前缀，xorriso 才肯读")
+    if let index = merged.firstIndex(of: "-C"), index + 1 < merged.count {
+        expectEqual(merged[index + 1], "2592,546880", "-C 上段起始,下段起始")
+    } else {
+        expect(false, "嫁接段缺少 -C 参数")
+    }
+
+    // 我们按扇区抄出来的旧段稀疏映像就是个普通文件，不能再加 stdio: 前缀。
+    let sparse = AppendTarget(devicePath: "/tmp/旧段映像.iso", lastSessionStart: 2592, nextWritableAddress: 546880)
+    let fromImage = Xorriso.arguments(source: source, outputURL: output, volumeName: "DATA", graft: sparse)
+    expect(fromImage.contains("/tmp/旧段映像.iso"), "稀疏映像直接用路径")
+    expect(!fromImage.contains("stdio:/tmp/旧段映像.iso"), "普通文件不加 stdio: 前缀")
+
+    expectEqual(Xorriso.parsePrintedSize("xorriso : UPDATE : 3 files added\n185\n"), 185, "扇区数")
+    expectNil(Xorriso.parsePrintedSize("no numbers here"), "没有数字时返回 nil")
+
+    // -print-size 的位置两套工具不一样：xorriso 放在 `-as mkisofs` 之后才算数，
+    // 放错了它会把整个映像真的生成一遍，还拿不到数字（自检里踩过这个坑）。
+    if Xorriso.isAvailable {
+        let folder = try makeTempDirectory("估算")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try "内容".write(to: folder.appendingPathComponent("说明.txt"), atomically: true, encoding: .utf8)
+        let bytes = try Xorriso.estimatedBytes(source: folder, volumeName: "DATA", graft: nil)
+        expect(bytes > 0 && bytes % 2048 == 0, "xorriso 能按扇区报出映像大小（\(bytes) 字节）")
+    } else {
+        print("  · 跳过 xorriso 估算：没装 xorriso")
+    }
+}
+
+run("mkisofs 的 Joliet 缺陷能被识别") {
+    // cdrtools 的 mkisofs 把非 ASCII 名字转 Joliet 时只保留前 8 个字符（自检里实测过），
+    // 所以它只当兜底引擎用，并且要把会被写坏的名字挑出来提醒用户。
+    expectEqual(Mkisofs.namesBreakingJoliet(["短的.txt", "abcdefghij.txt", "说明.txt"]), [], "ASCII 长名不受影响")
+    expectEqual(Mkisofs.namesBreakingJoliet(["一二三四五六七八.txt"]).count, 1, "长中文名会被写坏")
+    expectEqual(Mkisofs.baseArguments.first, "-input-charset", "mkisofs 也要显式声明 UTF-8 输入")
+    expect(Xorriso.baseArguments.contains("-input-charset"), "xorriso 同样显式声明 UTF-8 输入")
+}
+
+run("判断卷有没有被挂载") {
+    // 挂载状态决定嫁接时能不能直接读光驱（挂载着会 Resource busy），
+    // 判据不能看 diskutil 的 MountPoint 字段——没挂载时它也给一个空值。
+    expect(Multisession.isMounted(deviceNode: "/dev/definitely-not-a-disk") == false, "不存在的设备不算挂载")
+    if let result = try? Shell.run("mount", []),
+       let line = result.output.split(separator: "\n").first,
+       let device = line.split(separator: " ").first.map(String.init) {
+        expect(Multisession.isMounted(deviceNode: device), "\(device) 出现在 mount 输出里，应判为已挂载")
+        expect(Multisession.isMounted(deviceNode: device + "s99") == false, "只有前缀相同的设备不能算挂载")
+    } else {
+        expect(false, "读不到 mount 输出")
+    }
+    expect(Multisession.unmount(deviceNode: "/dev/definitely-not-a-disk") == true, "没挂载的设备直接算已卸载")
+}
+
+run("引擎选择与命名规则") {
+    let universal = ImageOptions(volumeName: "自检")
+    let engine = DataImageEngine.preferred(for: universal)
+    let expected: DataImageEngine = Xorriso.isAvailable ? .xorriso : (Mkisofs.isAvailable ? .mkisofs : .makehybrid)
+    expectEqual(engine, expected, "装了 xorriso 就用 xorriso")
+    expectEqual(
+        engine.localizedSummary,
+        engine == .makehybrid ? "ISO 9660 + Joliet + UDF" : "ISO 9660 + Joliet + Rock Ridge",
+        "通用预设选用的引擎"
+    )
+    expectEqual(engine.supportsMultisessionAppend, engine != .makehybrid, "只有 mkisofs 系工具能追加")
+    let pureUDF = ImageOptions(volumeName: "自检", includeISO9660: false, includeJoliet: false, includeUDF: true)
+    expectEqual(DataImageEngine.preferred(for: pureUDF), .makehybrid, "纯 UDF 预设用系统自带工具")
+    expectEqual(DataImageEngine.xorriso.nameRules(for: universal).jolietMaxCharacters, 103, "xorriso 的 Joliet 上限")
+    expectEqual(DataImageEngine.makehybrid.nameRules(for: universal).jolietMaxCharacters, 64, "系统自带工具的 Joliet 上限")
+    expectEqual(DataImageEngine.xorriso.nameRules(for: universal).sanitizeCharacterLimit, 103, "自动重命名按 103 截断")
+    expectEqual(DataImageEngine.xorriso.toolName, "xorriso", "界面显示的工具名")
+    expectEqual(DataImageEngine.makehybrid.toolName, "系统自带工具", "系统工具的显示名")
+    expectEqual(DataImageEngine.makehybrid.supportsMultisessionAppend, false, "系统自带工具不能嫁接")
+}
+
+run("多区段嫁接：新段里同时看得到旧文件和新文件") {
+    guard let engine = graftEngine() else {
+        print("  · 跳过：这台机器没装 xorriso / mkisofs（\(Xorriso.installHint)）")
+        return
+    }
+    let folder = try makeTempDirectory("graft")
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    // 第 1 段：中文名字 + 子目录
+    let first = folder.appendingPathComponent("第一段", isDirectory: true)
+    let nested = first.appendingPathComponent("子目录", isDirectory: true)
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    try "旧内容-OK".write(to: first.appendingPathComponent("旧的说明.txt"), atomically: true, encoding: .utf8)
+    try "嵌套-OK".write(to: nested.appendingPathComponent("嵌套.txt"), atomically: true, encoding: .utf8)
+    let session1 = folder.appendingPathComponent("session1.iso")
+    try buildSession(source: first, output: session1, volumeName: "S1", graft: nil)
+
+    // 把第 1 段摆到「盘」上：这一段从绝对扇区 0 开始，下一段从 next 开始
+    let next = Int((Workspace.fileSize(of: session1) + 2047) / 2048) + 48
+    var disc = try Data(contentsOf: session1)
+    disc.append(Data(count: next * 2048 - disc.count))
+    let discURL = folder.appendingPathComponent("disc.iso")
+    try disc.write(to: discURL)
+
+    // 第 2 段：映像工具从「盘」里读第 1 段的目录树，新文件写在第 2 段
+    let second = folder.appendingPathComponent("第二段", isDirectory: true)
+    try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+    try "新内容-OK".write(to: second.appendingPathComponent("新的说明.txt"), atomically: true, encoding: .utf8)
+    let session2 = folder.appendingPathComponent("session2.iso")
+    let target = AppendTarget(devicePath: discURL.path, lastSessionStart: 0, nextWritableAddress: next, oldFileCount: 2)
+    try engine.buildImage(source: second, outputURL: session2, options: ImageOptions(volumeName: "S2"), graft: target)
+    // 刻之前必须自己验一遍：根目录是绝对地址、并且真的引用了旧文件
+    try Multisession.verifyGraft(imageURL: session2, nextWritableAddress: next, expectedOldFiles: 2)
+    expect(true, "嫁接出来的段通过了校验（绝对地址 + 引用到旧文件）")
+    disc.append(try Data(contentsOf: session2))
+    // 刻完之后，盘上才是「两段都在」——把这张盘落盘，后面按扇区读它。
+    try disc.write(to: discURL)
+
+    let entries = discEntries(inDisc: [UInt8](disc), sessionStart: next)
+    let names = entries.map { $0.name }
+    expect(names.contains("旧的说明.txt"), "新段应能看到旧文件（中文名保留）")
+    expect(names.contains("新的说明.txt"), "新段应包含新文件")
+    expect(names.contains("子目录"), "新段应能看到旧的子目录")
+
+    func text(at extent: Int, size: Int) -> String? {
+        let start = extent * 2048
+        guard extent >= 0, size > 0, start + size <= disc.count else { return nil }
+        return String(bytes: disc[start..<(start + size)], encoding: .utf8)
+    }
+    if let old = entries.first(where: { $0.name == "旧的说明.txt" }) {
+        expect(old.extent < next, "旧文件仍指向第 1 段的扇区（绝对地址，没有重写数据）")
+        expectEqual(text(at: old.extent, size: old.size) ?? "", "旧内容-OK", "旧文件内容")
+    } else {
+        expect(false, "目录树里没有找到旧文件")
+    }
+    if let fresh = entries.first(where: { $0.name == "新的说明.txt" }) {
+        expect(fresh.extent >= next, "新文件应落在第 2 段里")
+        expectEqual(text(at: fresh.extent, size: fresh.size) ?? "", "新内容-OK", "新文件内容")
+    } else {
+        expect(false, "目录树里没有找到新文件")
+    }
+    // 嫁接之前要数得出旧段里有几个文件，刻完拿它当验收标准
+    expectEqual(Multisession.fileCount(deviceNode: discURL.path, sessionStart: 0), 2, "数出第 1 段里有 2 个文件")
+    expectEqual(Multisession.fileCount(deviceNode: discURL.path, sessionStart: next), 3, "第 2 段的目录树里有 3 个文件")
+}
+
+run("嫁接校验：没合并旧内容的段会被拦下来") {
+    guard graftEngine() != nil else {
+        print("  · 跳过：没装映像工具")
+        return
+    }
+    let folder = try makeTempDirectory("graftcheck")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let source = folder.appendingPathComponent("内容", isDirectory: true)
+    try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+    try "只有新内容".write(to: source.appendingPathComponent("新.txt"), atomically: true, encoding: .utf8)
+    let standalone = folder.appendingPathComponent("standalone.iso")
+    try buildSession(source: source, output: standalone, volumeName: "S1", graft: nil)
+
+    // 这一段是按「自己从第 0 扇区开始」做的（旧版本就是这么刻的）：
+    // 放到第 300 扇区上，根目录地址会小于 300，属于区段相对寻址。
+    var failure: MultisessionError?
+    do {
+        try Multisession.verifyGraft(imageURL: standalone, nextWritableAddress: 300, expectedOldFiles: 2)
+    } catch let error as MultisessionError {
+        failure = error
+    } catch {
+        failure = nil
+    }
+    if case .graftNotAbsolute = failure {
+        expect(true, "报的是「目录树地址没落在本段范围内」")
+    } else {
+        expect(false, "没合并旧内容的段必须报地址错误，实际：\(String(describing: failure))")
+    }
+
+    // 反过来：把同一段按它自己的位置（从 0 开始）校验，就应该通过。
+    try? Multisession.verifyGraft(imageURL: standalone, nextWritableAddress: 0, expectedOldFiles: 0)
+    expect(true, "位置对得上时不报错")
+}
+
+run("稀疏映像兜底：把旧段按扇区抄出来，照样能接着嫁接") {
+    guard let engine = graftEngine() else {
+        print("  · 跳过：没装映像工具")
+        return
+    }
+    let folder = try makeTempDirectory("sparse")
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    // 盘上先有两段（第 1 段从 0 开始，第 2 段从 next2 开始）
+    let first = folder.appendingPathComponent("第一段", isDirectory: true)
+    try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+    try "旧内容-OK".write(to: first.appendingPathComponent("旧的说明.txt"), atomically: true, encoding: .utf8)
+    let s1 = folder.appendingPathComponent("s1.iso")
+    try buildSession(source: first, output: s1, volumeName: "S1", graft: nil)
+    let next2 = Int((Workspace.fileSize(of: s1) + 2047) / 2048) + 48
+    var disc = try Data(contentsOf: s1)
+    disc.append(Data(count: next2 * 2048 - disc.count))
+    let discURL = folder.appendingPathComponent("disc.iso")
+    try disc.write(to: discURL)
+
+    let second = folder.appendingPathComponent("第二段", isDirectory: true)
+    try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+    try "新内容-OK".write(to: second.appendingPathComponent("新的说明.txt"), atomically: true, encoding: .utf8)
+    let s2 = folder.appendingPathComponent("s2.iso")
+    let target2 = AppendTarget(devicePath: discURL.path, lastSessionStart: 0, nextWritableAddress: next2, oldFileCount: 1)
+    try engine.buildImage(source: second, outputURL: s2, options: ImageOptions(volumeName: "S2"), graft: target2)
+    disc.append(try Data(contentsOf: s2))
+
+    // 第 3 段要接在第 2 段后面；这次不用设备，而是按扇区把旧段抄成稀疏映像再交给工具。
+    let next3 = next2 + Int((Workspace.fileSize(of: s2) + 2047) / 2048) + 48
+    // 盘本身比已写内容大得多，后面那段空的地方按真实介质补齐。
+    disc.append(Data(count: max(0, next3 * 2048 - disc.count)))
+    try disc.write(to: discURL)
+
+    let layout = DiscLayout(sessionStarts: [0, next2], nextWritableAddress: next3, recordedSessions: 2)
+    let sparse = folder.appendingPathComponent("旧段映像.iso")
+    try Multisession.sparseGraftImage(deviceNode: discURL.path, layout: layout, outputURL: sparse)
+    expectEqual(Workspace.fileSize(of: sparse), Int64(next3 * 2048), "稀疏映像长度按盘上位置撑到下一段起点")
+
+    let third = folder.appendingPathComponent("第三段", isDirectory: true)
+    try FileManager.default.createDirectory(at: third, withIntermediateDirectories: true)
+    try "第三段内容".write(to: third.appendingPathComponent("三.txt"), atomically: true, encoding: .utf8)
+    let s3 = folder.appendingPathComponent("s3.iso")
+    // 真刻的时候先试光驱本身，读不了才换成这张稀疏映像；两者的段地址是同一套。
+    let onDisc = AppendTarget(devicePath: discURL.path, lastSessionStart: next2, nextWritableAddress: next3, oldFileCount: 2)
+    let target3 = onDisc.usingImage(at: sparse)
+    expect(!target3.isDevice, "换成映像后就不再当设备处理")
+    expectEqual(target3.lastSessionStart, next2, "换映像不影响上段起始")
+    expectEqual(target3.nextWritableAddress, next3, "换映像不影响下段起始")
+    try engine.buildImage(source: third, outputURL: s3, options: ImageOptions(volumeName: "S3"), graft: target3)
+    try Multisession.verifyGraft(imageURL: s3, nextWritableAddress: next3, expectedOldFiles: 2)
+    expect(true, "用稀疏映像嫁接出来的第 3 段也通过了校验")
+    disc.append(try Data(contentsOf: s3))
+
+    let entries = discEntries(inDisc: [UInt8](disc), sessionStart: next3)
+    let names = entries.map { $0.name }
+    expect(names.contains("旧的说明.txt"), "第 3 段里还看得到第 1 段的文件")
+    expect(names.contains("新的说明.txt"), "第 3 段里还看得到第 2 段的文件")
+    expect(names.contains("三.txt"), "第 3 段里有自己的新文件")
+}
+
+run("嫁接：让映像工具直接读「设备」这条路也能用（用磁盘映像模拟块设备）") {
+    guard let engine = graftEngine() else {
+        print("  · 跳过：没装映像工具")
+        return
+    }
+    let folder = try makeTempDirectory("graftdev")
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    // 盘上先有一段内容，下一段从 next 开始
+    let first = folder.appendingPathComponent("第一段", isDirectory: true)
+    try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+    try "旧内容-OK".write(to: first.appendingPathComponent("旧的说明.txt"), atomically: true, encoding: .utf8)
+    let s1 = folder.appendingPathComponent("s1.iso")
+    try buildSession(source: first, output: s1, volumeName: "S1", graft: nil)
+    let next = Int((Workspace.fileSize(of: s1) + 2047) / 2048) + 48
+    var disc = try Data(contentsOf: s1)
+    disc.append(Data(count: next * 2048 - disc.count))
+    let discURL = folder.appendingPathComponent("disc.iso")
+    try disc.write(to: discURL)
+
+    // 把这张「盘」挂成一个块设备节点（/dev/diskN）当成光驱来用：
+    // 真机上走的就是这条路（xorriso 要 stdio:/dev/diskN 才肯读块设备）。
+    guard let attach = try? Shell.run("hdiutil", [
+        "attach", "-nomount", "-imagekey", "diskimage-class=CRawDiskImage", discURL.path
+    ]), attach.succeeded,
+    let node = attach.output.split(separator: " ").first.map(String.init), node.hasPrefix("/dev/disk") else {
+        print("  · 跳过：这台机器没法把映像挂成块设备")
+        return
+    }
+    defer { _ = try? Shell.run("hdiutil", ["detach", node]) }
+    expect(Multisession.isMounted(deviceNode: node) == false, "刚挂出来的裸设备没有挂卷")
+
+    let second = folder.appendingPathComponent("第二段", isDirectory: true)
+    try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+    try "新内容-OK".write(to: second.appendingPathComponent("新的说明.txt"), atomically: true, encoding: .utf8)
+    let s2 = folder.appendingPathComponent("s2.iso")
+    let target = AppendTarget(devicePath: node, lastSessionStart: 0, nextWritableAddress: next, oldFileCount: 1)
+    try engine.buildImage(source: second, outputURL: s2, options: ImageOptions(volumeName: "S2"), graft: target)
+    try Multisession.verifyGraft(imageURL: s2, nextWritableAddress: next, expectedOldFiles: 1)
+    expect(true, "直接读设备嫁接出来的段通过了校验")
+    disc.append(try Data(contentsOf: s2))
+    try disc.write(to: discURL)
+
+    let entries = discEntries(inDisc: [UInt8](disc), sessionStart: next)
+    let names = entries.map { $0.name }
+    expect(names.contains("旧的说明.txt"), "新段里能看到设备上旧段的文件")
+    expect(names.contains("新的说明.txt"), "新段里能看到这次新加的文件")
+}
+
 print("")
 if failureCount == 0 {
     print("全部 \(checkCount) 项检查通过 ✅")

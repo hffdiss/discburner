@@ -89,6 +89,8 @@ public final class BurnJob {
     public let request: BurnRequest
     private let canceller = CommandCanceller()
     private var workspace: Workspace?
+    /// 为了独占读盘而卸下来的光驱设备（刻录失败时要把卷挂回去）。
+    private var unmountedDeviceNode: String?
     private let startedAt = Date()
 
     public init(request: BurnRequest) {
@@ -108,6 +110,10 @@ public final class BurnJob {
             // 失败时也要把暂存目录清掉，否则会在缓存里留下一份完整拷贝
             if !request.keepWorkspace {
                 workspace?.cleanup()
+            }
+            // 嫁接前为了独占读盘卸下来的卷，失败时挂回去，别让用户以为盘出了问题。
+            if let device = unmountedDeviceNode {
+                _ = Multisession.mount(deviceNode: device)
             }
             throw error
         }
@@ -274,7 +280,8 @@ public final class BurnJob {
                     payloadBytes: prepared.payloadBytes,
                     fileCount: prepared.fileCount,
                     topLevelItems: request.items.map { $0.lastPathComponent },
-                    wasTestBurn: false
+                    wasTestBurn: false,
+                    filesystem: prepared.filesystem
                 )
             )
         }
@@ -296,6 +303,8 @@ public final class BurnJob {
         /// true 表示这个映像文件是用户自己的，不要删。
         var keepImage: Bool
         var fileCount: Int
+        /// 这次用的文件系统（用于记录与提示）。
+        var filesystem: String
     }
 
     /// 直接刻录现成映像文件时返回它的 URL（.iso / .dmg / .cdr / .toast / .cue / .toc）。
@@ -317,8 +326,24 @@ public final class BurnJob {
             if let capacity = status.writableBytes, bytes > capacity, !request.force {
                 throw BurnError.capacityExceeded(required: bytes, available: capacity)
             }
-            return PreparedImage(imageURL: direct, payloadBytes: bytes, keepImage: true, fileCount: 1)
+            // 现成映像文件是按「自己就是从第 0 扇区开始」做的，落到第 N 段上时地址会错位，
+            // 所以这种刻法不会把旧区段合并进来——盘上已经有内容时提醒一句。
+            if (status.sessions ?? 0) > 0 {
+                report(
+                    onUpdate,
+                    .checking,
+                    0.12,
+                    "⚠︎ 直接刻映像文件不会合并盘上旧区段：Windows / Linux 只会看到新段里的内容。要合并旧内容请改用「文件 / 文件夹」。",
+                    log: "⚠︎ 直接刻映像文件：不会做多区段嫁接"
+                )
+            }
+            return PreparedImage(imageURL: direct, payloadBytes: bytes, keepImage: true, fileCount: 1, filesystem: "现成映像")
         }
+
+        // 用哪套引擎、要不要接在已有区段后面写，先定下来（还会顺便检查旧盘兼不兼容）。
+        let engine = DataImageEngine.preferred(for: request.imageOptions)
+        let appendPlan = try resolveAppendPlan(status: status, engine: engine, onUpdate: onUpdate)
+        let mergedSessions = appendPlan == nil ? 0 : (status.sessions ?? 0)
 
         let workspace = try Workspace()
         self.workspace = workspace
@@ -327,9 +352,9 @@ public final class BurnJob {
         }
         report(onUpdate, .staging, 0.02, "正在整理 \(request.items.count) 个项目…")
 
-        // 兼容性规则跟着文件系统选项走：预检、自动重命名、最终映像三者用同一份规则。
+        // 兼容性规则跟着实际用的引擎走：预检、自动重命名、最终映像三者用同一份规则。
         var stageOptions = request.stageOptions
-        stageOptions.nameRules = request.imageOptions.nameRules
+        stageOptions.nameRules = engine.nameRules(for: request.imageOptions)
         let entries = try workspace.stage(items: request.items, options: stageOptions) { done, total, name in
             let fraction = total == 0 ? 0 : Double(done) / Double(total)
             self.report(
@@ -383,7 +408,12 @@ public final class BurnJob {
         var imageOptions = request.imageOptions
         imageOptions.volumeName = ImageBuilder.normalizeVolumeName(request.volumeName)
         var estimated = payloadBytes
-        if let printed = try? ImageBuilder.estimateSize(source: workspace.staging, options: imageOptions), printed > 0 {
+        if let printed = try? engine.estimatedBytes(
+            source: workspace.staging,
+            options: imageOptions,
+            graft: appendPlan?.target,
+            canceller: canceller
+        ), printed > 0 {
             estimated = printed
         }
         if let capacity = status.writableBytes, estimated > capacity, !request.force {
@@ -403,29 +433,190 @@ public final class BurnJob {
             throw WorkspaceError.notEnoughDiskSpace(required: estimated, available: localSpace)
         }
 
+        let mergeNote = mergedSessions > 0 ? "，合并盘上已有 \(mergedSessions) 段内容" : ""
         report(
             onUpdate,
             .buildingImage,
             0.15,
-            "正在生成光盘映像（\(imageOptions.localizedSummary)，卷标 \(imageOptions.volumeName)）…"
+            "正在生成光盘映像（\(engine.localizedSummary)\(mergeNote)，卷标 \(imageOptions.volumeName)）…"
         )
-        try ImageBuilder.buildImage(
-            source: workspace.staging,
-            outputURL: imageURL,
-            options: imageOptions,
-            canceller: canceller
-        ) { line in
-            let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return }
-            self.report(onUpdate, .buildingImage, 0.4, text, log: text)
-        }
+        try buildImage(
+            engine: engine,
+            staging: workspace.staging,
+            imageURL: imageURL,
+            imageOptions: imageOptions,
+            plan: appendPlan,
+            workspace: workspace,
+            canceller: canceller,
+            onUpdate: onUpdate
+        )
         return PreparedImage(
             imageURL: imageURL,
             payloadBytes: payloadBytes,
             keepImage: !temporaryImage,
-            fileCount: Workspace.fileCount(of: workspace.staging)
+            fileCount: Workspace.fileCount(of: workspace.staging),
+            filesystem: engine.localizedSummary
         )
     }
+
+    /// 一次追加刻录需要知道的两件事：盘的区段布局，以及把新段嫁接到哪儿。
+    struct AppendPlan {
+        var layout: DiscLayout
+        var target: AppendTarget
+    }
+
+    /// 这次要不要「接在已有区段后面写」；需要嫁接时返回旧段信息。
+    ///
+    /// 只有盘上确实已经有内容时才需要：空盘（或先擦盘）就是普通的单段刻录。
+    private func resolveAppendPlan(
+        status: DiscStatus,
+        engine: DataImageEngine,
+        onUpdate: @escaping (JobUpdate) -> Void
+    ) throws -> AppendPlan? {
+        // 只生成映像、或者这次会先擦盘，都按「从零开始」处理。
+        guard request.imageOnlyURL == nil, !request.burnOptions.eraseFirst else { return nil }
+        guard let reported = status.sessions, reported > 0 else { return nil }
+
+        let layout = (try? Multisession.layout(driveIndex: request.burnOptions.driveIndex)) ?? .empty
+        guard !layout.isEmpty,
+              let lastStart = layout.lastSessionStart,
+              let next = layout.nextWritableAddress,
+              next > lastStart else {
+            throw MultisessionError.appendUnsupported(
+                reason: "这张盘上已经有 \(reported) 段内容，但读不到区段起始 / 下一个可写地址，"
+                    + "无法安全地把新内容接上去。请换一张空盘重试。"
+            )
+        }
+        guard engine.supportsMultisessionAppend else { throw BurnError.appendNeedsIsoTool }
+        if let device = status.deviceNode,
+           Multisession.chainState(deviceNode: device, layout: layout) == .broken {
+            throw BurnError.appendIncompatibleDisc(sessions: layout.recordedSessions)
+        }
+        guard let device = status.deviceNode, !device.isEmpty else {
+            throw MultisessionError.appendUnsupported(reason: "拿不到光盘设备节点，无法把新内容嫁接到已有区段上。")
+        }
+        report(
+            onUpdate,
+            .checking,
+            0.1,
+            "追加刻录：新内容会接在第 \(layout.recordedSessions + 1) 段（合并盘上已有 "
+                + "\(layout.recordedSessions) 段内容，从扇区 \(next) 开始写）"
+        )
+        // 记下旧段里有多少文件：嫁接完要能在新段里找到它们，否则等于白刻。
+        let oldFiles = Multisession.fileCount(deviceNode: device, sessionStart: lastStart) ?? 0
+        if oldFiles > 0 {
+            report(onUpdate, .checking, 0.11, "盘上旧段里有 \(oldFiles) 个文件，刻完会一起出现在新段的目录树里")
+        }
+        return AppendPlan(
+            layout: layout,
+            target: AppendTarget(
+                devicePath: device,
+                lastSessionStart: lastStart,
+                nextWritableAddress: next,
+                oldFileCount: oldFiles
+            )
+        )
+    }
+
+    /// 生成映像：没有旧段就普通生成；有旧段就嫁接，并且刻之前先验一遍。
+    private func buildImage(
+        engine: DataImageEngine,
+        staging: URL,
+        imageURL: URL,
+        imageOptions: ImageOptions,
+        plan: AppendPlan?,
+        workspace: Workspace,
+        canceller: CommandCanceller?,
+        onUpdate: @escaping (JobUpdate) -> Void
+    ) throws {
+        func run(_ target: AppendTarget?) throws {
+            try engine.buildImage(
+                source: staging,
+                outputURL: imageURL,
+                options: imageOptions,
+                graft: target,
+                canceller: canceller
+            ) { fraction in
+                let percent = Int((fraction * 100).rounded())
+                self.report(onUpdate, .buildingImage, self.scale(fraction, 0.15, 0.5), "正在生成光盘映像… \(percent)%")
+            } onLog: { text in
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                self.report(onUpdate, .buildingImage, 0.4, trimmed, log: trimmed)
+            }
+        }
+
+        /// 嫁接完必须自己验一遍：根目录要用绝对地址，而且得真的引用到旧文件。
+        func verify(_ target: AppendTarget?) throws {
+            guard let target = target else { return }
+            try Multisession.verifyGraft(
+                imageURL: imageURL,
+                nextWritableAddress: target.nextWritableAddress,
+                expectedOldFiles: target.oldFileCount
+            )
+        }
+
+        /// mkisofs 写 Joliet 名字只保留前 8 个字符，写坏的名字会带 NUL，这里顺手报出来。
+        func reportBrokenJolietNames() {
+            guard engine == .mkisofs, let reader = IsoImageReader(fileURL: imageURL) else { return }
+            let broken = IsoTree.entries(in: reader).filter { $0.isJoliet && $0.name.contains("\0") }
+            guard !broken.isEmpty else { return }
+            let sample = broken.prefix(3).map { $0.name.replacingOccurrences(of: "\0", with: "") }.joined(separator: "、")
+            report(
+                onUpdate,
+                .buildingImage,
+                0.5,
+                "⚠︎ mkisofs 把 \(broken.count) 个名字写坏了（例如 \(sample)），Windows 上会缺字；"
+                    + "装 xorriso 就能修：\(Mkisofs.recommendedTool)",
+                log: "⚠︎ mkisofs 的 Joliet 名字转换只保留前 8 个字符：\n" + broken.prefix(20).map { "· \($0.name)" }.joined(separator: "\n")
+            )
+        }
+
+        guard let plan = plan else {
+            try run(nil)
+            reportBrokenJolietNames()
+            return
+        }
+
+        var target = plan.target
+        if target.isDevice {
+            // 卷挂载着的话 xorriso 打不开块设备，先卸下来独占读盘（写盘本来也该独占）。
+            if Multisession.unmount(deviceNode: target.devicePath) {
+                self.unmountedDeviceNode = target.devicePath
+                do {
+                    try run(target)
+                    try verify(target)
+                    reportBrokenJolietNames()
+                    return
+                } catch {
+                    report(
+                        onUpdate,
+                        .buildingImage,
+                        0.16,
+                        "直接读光驱失败，改成先把旧段按扇区拷成临时映像再嫁接…",
+                        log: "· 直接读光驱失败：\(error.localizedDescription)"
+                    )
+                }
+            }
+        }
+
+        // 兜底路线：自己做一张「只含旧段」的稀疏映像，让映像工具照着它嫁接。
+        let graftImageURL = workspace.root.appendingPathComponent("旧段映像.iso")
+        let layout = plan.layout
+        try Multisession.sparseGraftImage(
+            deviceNode: plan.target.devicePath,
+            layout: layout,
+            outputURL: graftImageURL
+        ) { fraction in
+            let percent = Int((fraction * 100).rounded())
+            self.report(onUpdate, .buildingImage, self.scale(fraction, 0.15, 0.25), "正在读取盘上旧段… \(percent)%")
+        }
+        target = plan.target.usingImage(at: graftImageURL)
+        try run(target)
+        try verify(target)
+        reportBrokenJolietNames()
+    }
+
     private func cleanup() {
         guard !request.keepWorkspace else { return }
         workspace?.cleanup()

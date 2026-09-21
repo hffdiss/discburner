@@ -1,7 +1,8 @@
 # 项目约定（给协作者和 AI 助手）
 
 这是 **DiscBurner（光盘刻录）**：macOS 上把任意文件刻到 CD / DVD / 蓝光的应用，
-图形界面 + 命令行两套入口，底层只用系统自带的 `drutil` / `hdiutil`。
+图形界面 + 命令行两套入口。写盘用系统自带的 `drutil`，映像用 `xorriso`（首选，
+多区段嫁接靠它）/ `mkisofs`（兜底）/ 系统自带的 `hdiutil makehybrid`。
 
 ## 硬性约定
 
@@ -47,6 +48,17 @@
 - 驱动器偶尔在刻完后短暂「认不到盘」（`drutil status` 报 No Media Inserted），
   `drutil eject` + `drutil tray close` 循环几次、或手动弹出再放回即可恢复，盘上的数据不受影响。
 - 任何会写盘的验证都要先跟用户确认，别拿用户的盘做实验。
+
+## 多区段追加（容易踩的坑）
+
+- **规范**：ISO 9660 多区段要求**光盘绝对地址**（第一帧 = 0），而且新段目录树要包含之前所有段的文件。
+  每段各自「从本段开头算地址」这种写法，Windows / Linux 读最后一段时会指到错误扇区，新老文件都看不到。
+- **实现**：`xorriso -as mkisofs -M <旧段来源> -C 上段起始,下段起始`。旧文件只是被引用，不重写数据。
+- **旧段来源**：优先 `-M stdio:/dev/diskN`（卷挂载着会 Resource busy，先 `diskutil unmount` 独占读盘）；
+  读不了就走 `Multisession.sparseGraftImage` 把旧段按扇区抄成稀疏映像再 `-M <文件>`。
+- **自校验**：`Multisession.verifyGraft` 会核对「根目录是绝对地址」+「引用了旧文件」，不过就中止刻录。
+- **mkisofs 的坑**：cdrtools 的 `mkisofs` 写 Joliet 名字只保留前 8 个字符（中文长名变 NUL），
+  所以只在没装 xorriso 时用它，并且要提示用户装 xorriso。
 
 ## 看界面的正确姿势
 
