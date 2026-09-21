@@ -284,8 +284,11 @@ final class AppModel: ObservableObject {
     enum BurnNoticeLevel { case info, warning, error }
 
     /// 「整盘合并重刻」这次用不用得上：盘上已经有内容，而且这张盘擦得掉。
+    ///
+    /// 「盘上已经有内容」必须用 `Multisession.needsGraft` 判断，不能看段数——
+    /// 空白盘的 `discinfo` 也会写 `Sessions: 1`（那条空白轨道）。
     var canMergeBeforeBurn: Bool {
-        guard status.isPresent, let sessions = status.sessions, sessions > 0, status.canBurn else { return false }
+        guard status.isPresent, Multisession.needsGraft(status: status) else { return false }
         return demoRewritable || status.erasable || status.media.isRewritable
     }
 
@@ -307,14 +310,18 @@ final class AppModel: ObservableObject {
 
     /// 追加刻录这一行的说明：会不会合并旧内容、缺不缺工具、旧盘兼不兼容。
     var appendNotice: (text: String, level: BurnNoticeLevel)? {
-        guard status.isPresent, let sessions = status.sessions, sessions > 0, status.canBurn else { return nil }
+        // 只有「盘上已经有内容、还能接着写」才有追加这回事：空白盘（哪怕是可重写盘）段数是 1，
+        // 但那是空白轨道，不是已有内容。
+        guard status.isPresent, Multisession.needsGraft(status: status) else { return nil }
+        let sessions = status.sessions ?? discLayout.recordedSessions
         if closeDisc {
             return ("这次会关闭光盘：刻完之后不能再往这张盘里加内容。", .info)
         }
         // 合并重刻不嫁接，所以「读不到区段」「工具不支持嫁接」这些限制都不适用。
         if willMergeWholeDisc {
+            let sizeHint = discWholeContent.map { "（盘上约 \(ByteText.human($0.totalBytes))）" } ?? ""
             return (
-                "整盘合并重刻：先把盘上已有的 \(sessions) 段内容读出来，和这次要刻的合成一份，"
+                "整盘合并重刻：先把盘上已有的 \(sessions) 段内容\(sizeHint)读出来，和这次要刻的合成一份，"
                     + "擦掉盘再单段刻完。Windows / macOS / Linux 看到的都是这一份完整内容。"
                     + "\n代价是慢：盘上内容要先整个读一遍，再整盘写一遍。",
                 .info
@@ -482,7 +489,8 @@ final class AppModel: ObservableObject {
         var text = "把 \(items.count) 个项目（\(size)）刻录到 \(media)，卷标「\(volumeName)」。"
         if willMergeWholeDisc {
             text += "\n追加方式：整盘合并重刻——先读盘上已有内容，擦除后单段刻完（Windows / macOS / Linux 都能看到全部内容）。"
-        } else if status.isPresent, let sessions = status.sessions, sessions > 0, status.canBurn {
+        } else if status.isPresent, Multisession.needsGraft(status: status) {
+            let sessions = status.sessions ?? discLayout.recordedSessions
             text += "\n追加方式：追加写入第 \(sessions + 1) 段（macOS / Linux 默认只看得到第一段）。"
         }
         text += "\n刻录速度：\(speedSummaryLine)"
