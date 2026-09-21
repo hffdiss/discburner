@@ -49,7 +49,7 @@ open dist/DiscBurner.app   # 打开图形界面
 
 不想自己编译的话，直接去 **[Releases](https://github.com/hffdiss/discburner/releases)** 下最新的
 `DiscBurner-<版本>.dmg`，打开后把「光盘刻录」拖进「应用程序」就行；
-`DiscBurner-<版本>.zip` 是解压即用的版本。当前版本 **1.2.0**。
+`DiscBurner-<版本>.zip` 是解压即用的版本。当前版本 **1.3.0**。
 
 `./build.sh` 会产出三样东西：
 
