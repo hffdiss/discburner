@@ -80,6 +80,9 @@ struct ContentView: View {
         .sheet(item: $model.burnPrep) { prep in
             BurnPrepView(prep: prep).environmentObject(model)
         }
+        .sheet(isPresented: $model.showSettings) {
+            SettingsView().environmentObject(model)
+        }
     }
 
     // MARK: - 左侧文件列表
@@ -557,6 +560,17 @@ struct ContentView: View {
                         .font(.system(size: 11))
                 }
                 Spacer(minLength: 12)
+                // 设置藏在这颗小齿轮里（菜单「光盘刻录 → 设置…」⌘, 也能开），
+                // 平时不抢注意力，要用的时候就在手边。
+                Button {
+                    model.showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(PlainButtonStyle())
+                .foregroundColor(.secondary)
+                .help("设置：外观、版本号（⌘,）")
                 // 主操作固定在右下角：右侧设置栏是滚动区，
                 // 窗口不够高时「开始刻录」会掉到折叠线以下，这里保证它永远可见。
                 if model.isBusy {
@@ -635,6 +649,8 @@ struct ContentView: View {
         case .checkCompatibility:
             guard !model.items.isEmpty else { return }
             model.runCompatibilityScan(reveal: true)
+        case .settings:
+            model.showSettings = true
         case .refresh:
             model.refresh()
         case .toggleLog:

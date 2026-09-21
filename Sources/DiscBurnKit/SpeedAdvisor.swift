@@ -185,4 +185,16 @@ public enum SpeedAdvisor {
         let hours = minutes / 60
         return "\(hours) 小时 \(minutes % 60) 分"
     }
+
+    /// 刻录过程中那条状态文字：「已用 X，预计还要 Y」。
+    ///
+    /// 剩余时间按估算值减已用时间算，估完之后会变成 0 或负数 ——
+    /// 这时候不能说「预计还要 —」（`durationText(0)` 的占位符），那是「没算出来」的意思，
+    /// 用户看到会以为程序坏了。收尾阶段改成「正在收尾…」。
+    public static func progressText(elapsed: TimeInterval, remaining: TimeInterval) -> String {
+        let used = "已用 \(durationText(elapsed))"
+        if remaining <= 1 { return "\(used)，正在收尾…" }
+        if remaining < 60 { return "\(used)，预计还要不到 1 分钟" }
+        return "\(used)，预计还要 \(durationText(remaining))"
+    }
 }

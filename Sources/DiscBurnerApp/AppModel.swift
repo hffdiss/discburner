@@ -129,6 +129,15 @@ final class AppModel: ObservableObject {
     @Published var compatibilityScanning = false
     @Published var showCompatibility = false
     @Published var burnPrep: BurnPrep?
+    /// 设置面板（外观、版本号）是否打开。
+    @Published var showSettings = false
+    /// 外观：跟随系统 / 浅色 / 深色。选了就立刻生效，并且记住下次启动照旧。
+    @Published var appearance: AppAppearance = AppAppearance.stored() {
+        didSet {
+            UserDefaults.standard.set(appearance.rawValue, forKey: AppModel.appearanceKey)
+            appearance.apply()
+        }
+    }
     /// 刻录时是否自动重命名不兼容的文件名（记住上次选择）。
     @Published var sanitizeNames: Bool = UserDefaults.standard.bool(forKey: AppModel.sanitizeNamesKey) {
         didSet { UserDefaults.standard.set(sanitizeNames, forKey: AppModel.sanitizeNamesKey) }
@@ -137,6 +146,7 @@ final class AppModel: ObservableObject {
     static let sanitizeNamesKey = "DiscBurner.sanitizeNames"
     static let showDiscBrowserKey = "DiscBurner.showDiscBrowser"
     static let speedChoiceKey = "DiscBurner.speedChoice"
+    static let appearanceKey = "DiscBurner.appearance"
 
     private var job: BurnJob?
     private var pollTimer: Timer?
@@ -585,13 +595,15 @@ final class AppModel: ObservableObject {
                     self.taskFraction = 1
                     let detail = self.jobFinishMessage
                         ?? (outcome.wasTestBurn ? "测试刻录完成" : "刻录完成")
+                    // 耗时用 durationText，别写成「86 秒」这种要自己换算的说法。
+                    let spent = SpeedAdvisor.durationText(outcome.duration)
                     if let image = outcome.imageURL {
-                        self.taskMessage = "映像已生成"
-                        self.finishedMessage = "已生成光盘映像：\n\(image.path)\n大小 \(ByteText.human(outcome.payloadBytes))"
+                        self.taskMessage = "映像已生成 · 用时 \(spent)"
+                        self.finishedMessage = "已生成光盘映像：\n\(image.path)\n"
+                            + "大小 \(ByteText.human(outcome.payloadBytes))，用时 \(spent)。"
                     } else {
-                        self.taskMessage = detail
-                        self.finishedMessage = detail + "。\n用时 " +
-                            String(format: "%.0f", outcome.duration) + " 秒。"
+                        self.taskMessage = detail + " · 用时 \(spent)"
+                        self.finishedMessage = detail + "。\n用时 \(spent)。"
                     }
                 }
                 self.refresh()

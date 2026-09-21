@@ -12,6 +12,7 @@ enum AppCommand: String {
     case eject
     case showContents
     case checkCompatibility
+    case settings
     case refresh
     case toggleLog
     case revealCLI

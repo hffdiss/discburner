@@ -481,6 +481,30 @@ run("刻录耗时估算") {
     expectEqual(SpeedAdvisor.durationText(150), "2 分 30 秒", "分钟+秒")
     expectEqual(SpeedAdvisor.durationText(600), "10 分钟", "整分钟")
     expectEqual(SpeedAdvisor.durationText(3700), "1 小时 1 分", "小时")
+    expectEqual(SpeedAdvisor.durationText(0), "—", "0 秒是「没算出来」的占位符")
+
+    // 刻录中的那条状态文字：估完之后不能变成「预计还要 —」
+    expectEqual(
+        SpeedAdvisor.progressText(elapsed: 30, remaining: 300),
+        "已用 30 秒，预计还要 5 分钟",
+        "正常估算"
+    )
+    expectEqual(
+        SpeedAdvisor.progressText(elapsed: 120, remaining: 40),
+        "已用 2 分钟，预计还要不到 1 分钟",
+        "不到一分钟时换个说法"
+    )
+    expectEqual(
+        SpeedAdvisor.progressText(elapsed: 200, remaining: 0),
+        "已用 3 分 20 秒，正在收尾…",
+        "估完了就说正在收尾，不能说「预计还要 —」"
+    )
+    expectEqual(
+        SpeedAdvisor.progressText(elapsed: 200, remaining: -15),
+        "已用 3 分 20 秒，正在收尾…",
+        "超出估算时间也不该出现占位符"
+    )
+    expect(!SpeedAdvisor.progressText(elapsed: 10, remaining: 0).contains("—"), "整条文字里不该有占位符")
 }
 
 run("名字清洗：非法字符 / 结尾点空格 / 保留名 / 空名") {

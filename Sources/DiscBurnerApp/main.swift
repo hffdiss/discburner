@@ -95,6 +95,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     let model = AppModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 先定外观，再建窗口，免得窗口先按系统外观画一遍再跳变。
+        AppAppearance.stored().apply()
         buildMenu()
 
         let window = NSWindow(
@@ -145,8 +147,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         // 截屏用：把「刻录完成」弹窗直接摆出来，不必真的刻一张盘。
         if launchArguments.contains("--demo-notice") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                let free = self?.model.status.writableBytes.map { "，还剩 \(ByteText.human($0))" } ?? ""
-                self?.model.finishedMessage = "刻录完成 · 光盘仍可继续追加\(free)。\n用时 35 秒。"
+                guard let self = self else { return }
+                let free = self.model.status.writableBytes.map { "，还剩 \(ByteText.human($0))" } ?? ""
+                let detail = "刻录完成 · 光盘仍可继续追加\(free)"
+                let spent = SpeedAdvisor.durationText(86)
+                self.model.phase = .finished
+                self.model.taskFraction = 1
+                self.model.taskMessage = detail + " · 用时 \(spent)"
+                self.model.finishedMessage = detail + "。\n用时 \(spent)。"
+            }
+        }
+
+        // 截屏用：摆出「正在刻录」的状态栏（同样不真刻盘）。
+        if launchArguments.contains("--demo-progress") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self = self else { return }
+                self.model.phase = .burning
+                self.model.taskFraction = 0.72
+                self.model.taskMessage = "正在刻录… "
+                    + SpeedAdvisor.progressText(elapsed: 151, remaining: 65)
             }
         }
     }
@@ -245,6 +264,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu(title: "光盘刻录")
         appMenu.addItem(withTitle: "关于光盘刻录", action: #selector(showAbout), keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "隐藏光盘刻录", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthers = appMenu.addItem(
@@ -356,21 +377,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     @objc private func ejectDisc() { CommandBus.post(.eject) }
     @objc private func showContents() { CommandBus.post(.showContents) }
     @objc private func checkCompatibility() { CommandBus.post(.checkCompatibility) }
+    @objc private func openSettings() { CommandBus.post(.settings) }
     @objc private func refreshDrives() { CommandBus.post(.refresh) }
     @objc private func toggleLog() { CommandBus.post(.toggleLog) }
     @objc private func revealCLI() { CommandBus.post(.revealCLI) }
     @objc private func openHelp() { CommandBus.post(.openHelp) }
 
     @objc private func showAbout() {
-        let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "1.0"
-        var credits = "把任意文件刻录到 CD / DVD / 蓝光光盘\n基于 macOS 自带的 drutil 与 hdiutil"
+        var credits = "版本 \(AppVersion.display)\n把任意文件刻录到 CD / DVD / 蓝光光盘\n基于 macOS 自带的 drutil 与 hdiutil"
         if let cli = AppPaths.bundledCLI {
             credits += "\n内置命令行工具：\(cli.path)"
         }
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "光盘刻录",
-            .applicationVersion: version,
+            .applicationVersion: AppVersion.short,
             .credits: NSAttributedString(string: credits),
         ])
     }
@@ -389,10 +409,15 @@ let launchDemoItems: [URL] = {
 }()
 
 /// `--render-preview <png> [路径…]`：渲染主窗口；
-/// `--render-compatibility <png> [路径…]`：渲染兼容性预检窗口。
-if launchArguments.contains("--render-preview") || launchArguments.contains("--render-compatibility") {
+/// `--render-compatibility <png> [路径…]`：渲染兼容性预检窗口；
+/// `--render-settings <png>`：渲染设置面板。
+if launchArguments.contains("--render-preview")
+    || launchArguments.contains("--render-compatibility")
+    || launchArguments.contains("--render-settings") {
     let compatibilityMode = launchArguments.contains("--render-compatibility")
-    let flag = compatibilityMode ? "--render-compatibility" : "--render-preview"
+    let settingsMode = launchArguments.contains("--render-settings")
+    let flag = settingsMode ? "--render-settings"
+        : (compatibilityMode ? "--render-compatibility" : "--render-preview")
     let index = launchArguments.firstIndex(of: flag)!
     let path = index + 1 < launchArguments.count && !launchArguments[index + 1].hasPrefix("-")
         ? launchArguments[index + 1]
@@ -403,7 +428,16 @@ if launchArguments.contains("--render-preview") || launchArguments.contains("--r
         .map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
     let previewApplication = NSApplication.shared
     previewApplication.setActivationPolicy(.accessory)
-    if compatibilityMode {
+    // 预览也要跟用户选的外观一致，否则看到的深浅色跟 App 里不一样。
+    AppAppearance.stored().apply()
+    if settingsMode {
+        renderPreview(
+            to: URL(fileURLWithPath: path),
+            items: [],
+            size: NSSize(width: 520, height: 430),
+            makeView: { AnyView(SettingsView().environmentObject($0)) }
+        )
+    } else if compatibilityMode {
         renderPreview(
             to: URL(fileURLWithPath: path),
             items: previewItems,

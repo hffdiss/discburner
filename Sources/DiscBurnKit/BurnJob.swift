@@ -201,17 +201,20 @@ public final class BurnJob {
         if estimated > 0, !request.burnOptions.testBurn {
             ticker.start(estimatedSeconds: estimated) { elapsed in
                 let fraction = min(0.9, 0.6 + 0.3 * (elapsed / estimated))
-                let remaining = max(0, estimated - elapsed)
+                // 剩余时间要传原值：估完变负数时 progressText 会改成「正在收尾…」，
+                // 掐到 0 再格式化只会得到「预计还要 —」。
+                let remaining = estimated - elapsed
                 self.report(
                     onUpdate,
                     .burning,
                     fraction,
-                    "正在刻录… 已用 \(SpeedAdvisor.durationText(elapsed))，预计还要 \(SpeedAdvisor.durationText(remaining))",
+                    "正在刻录… " + SpeedAdvisor.progressText(elapsed: elapsed, remaining: remaining),
                     log: nil
                 )
             }
         }
         defer { ticker.stop() }
+        let writeStartedAt = Date()
         _ = try Burner.burn(
             image: prepared.imageURL,
             options: request.burnOptions,
@@ -226,6 +229,12 @@ public final class BurnJob {
             let high: Double = update.phase == .verifying ? 0.98 : 0.9
             let fraction = self.scale(update.fraction, low, high)
             update.message = line.message.isEmpty ? update.phase.localizedName : line.message
+            if update.phase == .verifying {
+                // 校验阶段 drutil 也不给百分比，至少把已经花掉的时间写出来，
+                // 别让状态栏一直停在「正在校验…」上不动。
+                update.message = "正在校验数据… 已用 "
+                    + SpeedAdvisor.durationText(Date().timeIntervalSince(writeStartedAt))
+            }
             self.report(onUpdate, update.phase, fraction ?? 0.6, update.message, log: line.rawLine)
         }
         if !sawWritePhase {

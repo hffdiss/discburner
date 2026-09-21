@@ -134,6 +134,7 @@ cat > "$CONTENTS/Resources/命令行工具说明.txt" <<EOF
     discburn burn ~/Documents --fix-names
     discburn burn ~/backup.iso
     discburn erase --mode quick
+    discburn --version
 
 刻录前会先做兼容性预检（Windows 非法字符、保留名、大小写冲突、超长名…），
 加 --fix-names 可以自动把不兼容的名字改掉（只改光盘里的副本）。
@@ -186,6 +187,15 @@ if [[ "$PACKAGE" == "1" ]]; then
     ZIP="$DIST/DiscBurner-$VERSION.zip"
     rm -f "$ZIP"
     (cd "$DIST" && ditto -c -k --sequesterRsrc --keepParent "DiscBurner.app" "$ZIP")
+
+    # 每个版本单独一个目录：dist/v1.2.0/ 里放这一版的三件套，方便归档和回查
+    # （dist/ 不进仓库，所以这只是本机的版本档案）。
+    VERSION_DIR="$DIST/v$VERSION"
+    rm -rf "$VERSION_DIR"
+    mkdir -p "$VERSION_DIR"
+    cp -R "$APP" "$VERSION_DIR/"
+    cp "$DMG" "$ZIP" "$VERSION_DIR/"
+    (cd "$VERSION_DIR" && shasum -a 256 "DiscBurner-$VERSION.dmg" "DiscBurner-$VERSION.zip" > SHA256.txt)
 fi
 
 # ---------------------------------------------------------------- 汇总
@@ -198,6 +208,7 @@ echo "  自检程序：  $BUILD/universal/discburn-selftest"
 if [[ "$PACKAGE" == "1" ]]; then
     echo "  安装包：    $DIST/DiscBurner-$VERSION.dmg"
     echo "  压缩包：    $DIST/DiscBurner-$VERSION.zip"
+    echo "  版本目录：  $DIST/v${VERSION}（含 App、dmg、zip、SHA256.txt）"
 fi
 echo ""
 echo "架构：      $(lipo -archs "$CONTENTS/MacOS/DiscBurner" 2>/dev/null || echo 未知)"

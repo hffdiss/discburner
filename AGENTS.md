@@ -10,6 +10,8 @@
   构建一律用 `./build.sh`（约 110 秒，产出 `dist/DiscBurner.app`、`.dmg`、`.zip`）。
 - **自检必须全过**：`./.build-manual/universal/discburn-selftest`，加一条断言就要同步更新 README 里的项数。
 - **编译产物不进仓库**：`.build-manual/`、`build/`、`dist/` 已在 `.gitignore` 里，靠 `build.sh` 重新生成。
+- **每个版本有自己的目录**：`build.sh` 打包后会在 `dist/v<版本>/` 里放这一版的
+  App、dmg、zip 和 `SHA256.txt`（本地归档，同样不进仓库）。
 
 ## 改完之后：自动提交并推送
 
@@ -58,6 +60,12 @@
   `--args --demo-compatibility --demo-items <路径…>`，反了会加不进内容。
   `--demo-notice` 可以把「刻录完成」弹窗直接摆出来（不用真刻盘）。
 - 第一次让新构建的 App 读光盘时，macOS 可能弹「想访问可移除宗卷上的文件」，选「允许」。
+- **改外观/主题时别踩的坑**：`NSApp.appearance` 一旦被显式写过（哪怕写的是 `nil`），
+  AppKit 会把这个 App 的外观钉在当时的系统外观上——之后系统在深色/浅色之间自动切换它不再跟，
+  而新开的 sheet 仍按当前系统外观画，结果就是一个窗口深、一个窗口浅（实测踩过）。
+  所以「跟随系统」这一档**不要写 `NSApp.appearance`**，只在明确选了浅色/深色时才写。
+- 系统外观是「自动」时，一天里会在深色和浅色之间翻，判断「界面是不是坏了」之前先看一眼
+  `defaults read -g AppleInterfaceStyle`（读不到 = 当前是浅色）。
 
 ## 目录结构
 

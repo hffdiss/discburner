@@ -23,6 +23,18 @@ func printError(_ message: String) {
     FileHandle.standardError.write((red("错误：") + message + "\n").data(using: .utf8)!)
 }
 
+/// 命令行工具的版本号。
+///
+/// 随 App 一起分发时（`DiscBurner.app/Contents/MacOS/discburn`）能读到 App 的 Info.plist
+/// 里的版本；单独跑 `.build-manual/universal/discburn` 时读不到，就照实说，
+/// 免得编一个假版本号出来。
+let discburnVersionText: String = {
+    if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
+        return version
+    }
+    return "未知（未随 App 打包，版本号见仓库根的 VERSION 文件）"
+}()
+
 func usage() {
     print("""
     \(bold("discburn")) — 在 macOS 上把任意文件刻录到光盘（含外置 USB 光驱）
@@ -39,6 +51,7 @@ func usage() {
       discburn burn <路径…> [选项]           刻录到光盘
       discburn erase [--mode quick|full]    擦除可重写光盘
       discburn eject                        弹出光盘
+      discburn --version                    显示版本号
 
     \(bold("刻录选项"))
       --name <卷标>        光盘卷标（默认 DiscBurn_日期）
@@ -131,6 +144,8 @@ func parse(_ arguments: [String]) throws -> Options {
         switch argument {
         case "-h", "--help", "help":
             options.command = "help"
+        case "-v", "--version", "version":
+            options.command = "version"
         case "list", "drives":
             options.command = "list"
         case "status":
@@ -736,6 +751,7 @@ do {
     switch options.command {
     case "": usage()
     case "help": usage()
+    case "version": print("discburn \(discburnVersionText)")
     case "list": try commandList(quiet: options.quiet)
     case "status": try commandStatus(options: options)
     case "contents": try commandContents(options: options)
