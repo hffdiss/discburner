@@ -160,6 +160,14 @@ public final class BurnJob {
         if request.burnOptions.eraseFirst, !(status.erasable || status.media.isRewritable) {
             throw BurnError.notRewritable(status.media.displayName)
         }
+        // 「整盘合并重刻」必须擦得掉：读一遍旧内容 → 擦盘 → 把合并后的一份单段刻完。
+        // 只有盘上确实有内容、而且驱动器说这盘能追加（= 不是空白盘）时才走这条路。
+        let mergeWholeDisc = isMergeWholeDisc(status: status)
+        if mergeWholeDisc, !(status.erasable || status.media.isRewritable) {
+            throw BurnError.mergeNeedsRewritable(status.media.displayName)
+        }
+        // 合并重刻自己就要擦盘，用户没勾「先擦除」也得擦。
+        let eraseBeforeBurn = request.burnOptions.eraseFirst || mergeWholeDisc
         report(
             onUpdate,
             .checking,
@@ -172,8 +180,13 @@ public final class BurnJob {
         try checkCancelled()
 
         // 5. 需要时先擦除
-        if request.burnOptions.eraseFirst {
-            report(onUpdate, .erasing, 0.45, "正在擦除光盘…")
+        if eraseBeforeBurn {
+            report(
+                onUpdate,
+                .erasing,
+                0.45,
+                mergeWholeDisc ? "整盘合并重刻：正在擦除光盘…" : "正在擦除光盘…"
+            )
             try Burner.erase(
                 mode: .quick,
                 driveIndex: drive.index,
@@ -270,7 +283,10 @@ public final class BurnJob {
             // 区段号 = 这次刻的是这张盘的第几段。
             // 刻完立刻读到的区段数常常还差一段（驱动器要过几秒才把这一段算进
             // TOC），所以取「刻之前的段数 + 1」与「刻完读到的新值」里较大的那个。
-            let sessionIndex = max((status.sessions ?? 0) + 1, finalStatus?.sessions ?? 0)
+            // 合并重刻会把盘擦干净再单段刻完，所以这段永远是第 1 段（追加才是「在旧段后面加」）。
+            let sessionIndex = mergeWholeDisc
+                ? max(1, finalStatus?.sessions ?? 1)
+                : max((status.sessions ?? 0) + 1, finalStatus?.sessions ?? 0)
             BurnHistory.record(
                 BurnRecord(
                     volumeName: ImageBuilder.normalizeVolumeName(request.volumeName),
@@ -382,7 +398,7 @@ public final class BurnJob {
                 log: logText.trimmingCharacters(in: .newlines)
             )
         }
-        let payloadBytes = entries.reduce(Int64(0)) { $0 + $1.byteCount }
+        var payloadBytes = entries.reduce(Int64(0)) { $0 + $1.byteCount }
         report(onUpdate, .staging, 0.12, "内容大小 \(ByteText.human(payloadBytes))")
         try checkCancelled()
 
@@ -402,6 +418,14 @@ public final class BurnJob {
                     log: "· [\(issue.category.localizedName)] \(issue.relativePath ?? "整张盘")：\(issue.message)"
                 )
             }
+        }
+
+        // 「整盘合并重刻」：盘上已有的内容先读出来、并进暂存目录，后面就是普通的单段一次刻完。
+        // 可重写介质上走这条路，Windows / macOS / Linux 看到的就是同一份完整内容；
+        // 而追加成多区段的盘，macOS / Linux 默认只看得到第一段。
+        if isMergeWholeDisc(status: status) {
+            payloadBytes = try importDiscContent(status: status, into: workspace.staging, onUpdate: onUpdate)
+            try checkCancelled()
         }
 
         // 估算映像大小并检查光盘容量
@@ -459,6 +483,68 @@ public final class BurnJob {
         )
     }
 
+    /// 这次是不是「整盘合并重刻」：选了合并策略，而且盘上确实有内容（驱动器说这盘能追加）。
+    private func isMergeWholeDisc(status: DiscStatus) -> Bool {
+        request.burnOptions.appendStrategy == .rewriteMerged
+            && Multisession.needsGraft(status: status)
+    }
+
+    /// 把盘上已有的全部内容读出来、并进暂存目录，返回合并后整个待刻目录的字节数。
+    ///
+    /// 同名文件保留「这次新加的」那一份：用户选的内容先整理进暂存目录，盘上内容再按
+    /// 「已存在就跳过」的方式并进来。盘上本来就没有的文件照常导出。
+    private func importDiscContent(
+        status: DiscStatus,
+        into staging: URL,
+        onUpdate: @escaping (JobUpdate) -> Void
+    ) throws -> Int64 {
+        guard let device = status.deviceNode, !device.isEmpty else {
+            throw MultisessionError.appendUnsupported(reason: "拿不到光盘设备节点，读不出盘上已有的内容。")
+        }
+        let layout = (try? Multisession.layout(driveIndex: request.burnOptions.driveIndex)) ?? .empty
+        guard !layout.isEmpty else {
+            throw MultisessionError.appendUnsupported(reason: "读不到这张盘的区段信息，没法把旧内容合并进来。")
+        }
+        // 卷挂载着的时候读原始扇区要绕系统缓存，先卸下来独占读盘（刻录本来也该独占）。
+        if Multisession.unmount(deviceNode: device) {
+            unmountedDeviceNode = device
+        }
+        report(onUpdate, .staging, 0.13, "整盘合并重刻：正在读盘上已有的内容…")
+        guard let content = DiscContentReader.read(
+            deviceNode: device,
+            layout: layout,
+            includeJoliet: request.imageOptions.includeJoliet
+        ) else {
+            throw MultisessionError.appendUnsupported(
+                reason: "读不出这张盘上已有的内容（这一段可能读不出来）。"
+            )
+        }
+        report(onUpdate, .staging, 0.135, "盘上已有内容：\(content.summary)")
+        let summary = try DiscContentReader.extract(
+            content,
+            deviceNode: device,
+            to: staging,
+            conflict: .skipExisting,
+            canceller: canceller
+        ) { fraction in
+            let percent = Int((fraction * 100).rounded())
+            self.report(
+                onUpdate,
+                .staging,
+                self.scale(fraction, 0.135, 0.15),
+                "正在把盘上内容并进待刻目录… \(percent)%"
+            )
+        }
+        let bytes = Workspace.size(of: staging)
+        report(
+            onUpdate,
+            .staging,
+            0.15,
+            "合并完成：\(summary.description)，整个待刻目录 \(ByteText.human(bytes))"
+        )
+        return bytes
+    }
+
     /// 一次追加刻录需要知道的两件事：盘的区段布局，以及把新段嫁接到哪儿。
     struct AppendPlan {
         var layout: DiscLayout
@@ -475,6 +561,8 @@ public final class BurnJob {
     ) throws -> AppendPlan? {
         // 只生成映像、或者这次会先擦盘，都按「从零开始」处理。
         guard request.imageOnlyURL == nil, !request.burnOptions.eraseFirst else { return nil }
+        // 整盘合并重刻不做嫁接：内容已经在 prepareImage 里合并好了，擦完盘单段刻一次。
+        guard request.burnOptions.appendStrategy == .graft else { return nil }
         // 只有「可追加写入」的盘才需要嫁接：空白盘、刚擦过的盘都属于从零开始。
         guard Multisession.needsGraft(status: status, eraseFirst: request.burnOptions.eraseFirst) else { return nil }
         let reported = status.sessions ?? 0
@@ -503,6 +591,15 @@ public final class BurnJob {
             0.1,
             "追加刻录：新内容会接在第 \(layout.recordedSessions + 1) 段（合并盘上已有 "
                 + "\(layout.recordedSessions) 段内容，从扇区 \(next) 开始写）"
+        )
+        report(
+            onUpdate,
+            .checking,
+            0.105,
+            "⚠︎ 追加出来的盘 Windows 上正常，但 macOS / Linux 默认只看得到第一段"
+                + "（盘上数据没坏，是读的一方挑了旧的那一段）。要三边看到全部内容请改用「整盘合并重刻」。",
+            log: "⚠︎ macOS / Linux 默认只挂载多区段盘的第一段；"
+                + "在 Linux 上想读全部内容：mount -t iso9660 -o ro,sbsector=\(lastStart) /dev/sr0 /mnt"
         )
         // 记下旧段里有多少文件：嫁接完要能在新段里找到它们，否则等于白刻。
         let oldFiles = Multisession.fileCount(deviceNode: device, sessionStart: lastStart) ?? 0

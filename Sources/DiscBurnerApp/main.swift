@@ -128,6 +128,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
 
         NSApp.activate(ignoringOtherApps: true)
 
+        // 截屏用：把「这张盘可重写」当成真的，好看到「整盘合并重刻」那一行（不改任何盘）。
+        if launchArguments.contains("--demo-rewritable") {
+            model.demoRewritable = true
+        }
+
         // 排错/截屏用：`--demo-items <路径…>` 只把内容加进列表，
         // `--demo-compatibility <路径…>` 再加完内容后打开预检窗口，
         // `--demo-burnprep` 直接摆出「开始刻录？」确认单（光驱里没有可写盘时也能看）。

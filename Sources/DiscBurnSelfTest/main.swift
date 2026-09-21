@@ -1391,6 +1391,300 @@ run("嫁接：让映像工具直接读「设备」这条路也能用（用磁盘
     expect(names.contains("新的说明.txt"), "新段里能看到这次新加的文件")
 }
 
+// MARK: - 整盘内容（多区段盘读「一整份」）
+
+run("整盘内容：嫁接过的盘只读最后一段就拿到全部内容，导出后逐字节一致") {
+    guard let engine = graftEngine() else {
+        print("  · 跳过：没装 xorriso / mkisofs")
+        return
+    }
+    let folder = try makeTempDirectory("content")
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let first = folder.appendingPathComponent("第一段", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: first.appendingPathComponent("子目录"),
+        withIntermediateDirectories: true
+    )
+    try "第一段内容-OK".write(to: first.appendingPathComponent("说明.txt"), atomically: true, encoding: .utf8)
+    try "嵌套内容-OK".write(to: first.appendingPathComponent("子目录/嵌套.txt"), atomically: true, encoding: .utf8)
+    let s1 = folder.appendingPathComponent("s1.iso")
+    try buildSession(source: first, output: s1, volumeName: "S1", graft: nil)
+
+    let next = 2512
+    let second = folder.appendingPathComponent("第二段", isDirectory: true)
+    try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+    try "第二段内容-OK".write(to: second.appendingPathComponent("追加说明.txt"), atomically: true, encoding: .utf8)
+    let s2 = folder.appendingPathComponent("s2.iso")
+    let target = AppendTarget(devicePath: s1.path, lastSessionStart: 0, nextWritableAddress: next, oldFileCount: 2)
+    try engine.buildImage(source: second, outputURL: s2, options: ImageOptions(volumeName: "S2"), graft: target)
+
+    var disc = [UInt8](try Data(contentsOf: s1))
+    disc += [UInt8](repeating: 0, count: max(0, next * 2048 - disc.count))
+    disc += [UInt8](try Data(contentsOf: s2))
+    let layout = DiscLayout(
+        tracks: [],
+        sessionStarts: [0, next],
+        nextWritableAddress: next + 2048,
+        recordedSessions: 2
+    )
+    let reader = IsoImageReader(data: Data(disc))
+    guard let view = DiscContentReader.read(reader: reader, layout: layout) else {
+        expect(false, "应该能读出整盘内容")
+        return
+    }
+    let paths = view.files.map { $0.relativePath }
+    expectEqual(view.sessions, [next], "最后一段已经含旧段，只读这一段")
+    expect(view.fromLastSessionOnly, "判为「只读最后一段」")
+    expect(paths.contains("说明.txt"), "能列出第一段的文件")
+    expect(paths.contains("子目录/嵌套.txt"), "能列出第一段的子目录文件")
+    expect(paths.contains("追加说明.txt"), "能列出这次新加的文件")
+    expect(
+        view.files.filter { $0.relativePath != "追加说明.txt" }.allSatisfy { $0.extent < next },
+        "旧文件在嫁接段里仍然指向旧段地址"
+    )
+
+    let out = folder.appendingPathComponent("导出", isDirectory: true)
+    let summary = try DiscContentReader.extract(view, reader: reader, source: "自检映像", to: out)
+    expectEqual(summary.files, 3, "导出的文件数")
+    expectEqual(summary.skipped, 0, "没有跳过任何文件")
+    expectEqual(try String(contentsOf: out.appendingPathComponent("说明.txt"), encoding: .utf8), "第一段内容-OK", "第一段文件内容")
+    expectEqual(try String(contentsOf: out.appendingPathComponent("子目录/嵌套.txt"), encoding: .utf8), "嵌套内容-OK", "子目录文件内容")
+    expectEqual(try String(contentsOf: out.appendingPathComponent("追加说明.txt"), encoding: .utf8), "第二段内容-OK", "新段文件内容")
+
+    // 同名冲突：并进待刻目录时要保住「这次新加的」文件，导出模式才覆盖。
+    // 待刻目录里本来只有「这次新加的」说明.txt，其余文件是盘上独有的，应该照常导出。
+    let staging = folder.appendingPathComponent("待刻目录", isDirectory: true)
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+    try "这次新加的".write(to: staging.appendingPathComponent("说明.txt"), atomically: true, encoding: .utf8)
+    let skipped = try DiscContentReader.extract(view, reader: reader, source: "自检映像", to: staging, conflict: .skipExisting)
+    expectEqual(skipped.skipped, 1, "同名文件应被跳过")
+    expectEqual(skipped.files, 2, "盘上独有的文件照常导出")
+    expectEqual(try String(contentsOf: staging.appendingPathComponent("说明.txt"), encoding: .utf8), "这次新加的", "跳过时保住现有文件")
+    expectEqual(try String(contentsOf: staging.appendingPathComponent("子目录/嵌套.txt"), encoding: .utf8), "嵌套内容-OK", "跳过模式下子目录文件也要导出")
+    _ = try DiscContentReader.extract(view, reader: reader, source: "自检映像", to: out, conflict: .replace)
+    expectEqual(try String(contentsOf: out.appendingPathComponent("说明.txt"), encoding: .utf8), "第一段内容-OK", "覆盖时写回盘上的内容")
+}
+
+run("整盘内容：最后一段没嫁接就逐段合并，段相对地址的老盘也能读") {
+    guard graftEngine() != nil else {
+        print("  · 跳过：没装 xorriso / mkisofs")
+        return
+    }
+    let folder = try makeTempDirectory("content-merge")
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let first = folder.appendingPathComponent("第一段", isDirectory: true)
+    try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+    try "第一段-合并".write(to: first.appendingPathComponent("第一段说明.txt"), atomically: true, encoding: .utf8)
+    let s1 = folder.appendingPathComponent("s1.iso")
+    try buildSession(source: first, output: s1, volumeName: "S1", graft: nil)
+
+    let second = folder.appendingPathComponent("第二段", isDirectory: true)
+    try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+    try "第二段-合并".write(to: second.appendingPathComponent("第二段说明.txt"), atomically: true, encoding: .utf8)
+    let s2 = folder.appendingPathComponent("s2.iso")
+    try buildSession(source: second, output: s2, volumeName: "S2", graft: nil)
+
+    // 把第二段那份「从 0 开始算地址」的映像放到 2512：这正是旧版本刻出来的样子
+    // （地址是段相对的），同时也模拟了「最后一段没有嫁接」的情况。
+    let next = 2512
+    var disc = [UInt8](try Data(contentsOf: s1))
+    disc += [UInt8](repeating: 0, count: max(0, next * 2048 - disc.count))
+    disc += [UInt8](try Data(contentsOf: s2))
+    let reader = IsoImageReader(data: Data(disc))
+
+    let layout = DiscLayout(
+        tracks: [],
+        sessionStarts: [0, next],
+        nextWritableAddress: next + 2048,
+        recordedSessions: 2
+    )
+    guard let merged = DiscContentReader.read(reader: reader, layout: layout) else {
+        expect(false, "两段合并应该能读出内容")
+        return
+    }
+    expect(!merged.fromLastSessionOnly, "最后一段没嫁接时要逐段合并")
+    expectEqual(merged.sessions, [0, next], "合并用到的段")
+    expectEqual(
+        merged.files.map { $0.relativePath }.sorted(),
+        ["第一段说明.txt", "第二段说明.txt"],
+        "两段的文件都要在"
+    )
+    expect(merged.note != nil, "逐段合并要给出说明")
+
+    // 只看最后一段（旧盘：整张盘上只有这一段，地址却是段相对的）
+    let oldLayout = DiscLayout(
+        tracks: [],
+        sessionStarts: [next],
+        nextWritableAddress: next + 2048,
+        recordedSessions: 1
+    )
+    guard let old = DiscContentReader.read(reader: reader, layout: oldLayout) else {
+        expect(false, "段相对地址的老段应该也能读出来")
+        return
+    }
+    expectEqual(old.files.map { $0.relativePath }, ["第二段说明.txt"], "老段的文件")
+    expectEqual(old.files.first?.extent, next + (old.files.first?.extent ?? 0) - next, "地址已补回段起始")
+    expect((old.files.first?.extent ?? 0) >= next, "补回段起始后的地址落在本段内")
+    let out = folder.appendingPathComponent("老盘导出", isDirectory: true)
+    let oldSummary = try DiscContentReader.extract(old, reader: reader, source: "自检映像", to: out)
+    expectEqual(oldSummary.files, 1, "老盘导出的文件数")
+    expectEqual(
+        try String(contentsOf: out.appendingPathComponent("第二段说明.txt"), encoding: .utf8),
+        "第二段-合并",
+        "老盘文件内容读得出来"
+    )
+}
+
+run("整盘内容：导出路径清洗") {
+    expectEqual(DiscContentReader.sanitize(relativePath: "../../坏.txt") ?? "", "坏.txt", "挡掉往上级目录的路径")
+    expectEqual(DiscContentReader.sanitize(relativePath: "/绝对/路径.txt") ?? "", "绝对/路径.txt", "挡掉绝对路径前缀")
+    expectNil(DiscContentReader.sanitize(relativePath: "../.."), "只剩上级引用时没有可用路径")
+    expectNil(DiscContentReader.sanitize(relativePath: "   "), "空名字丢弃")
+    expectEqual(
+        DiscContentReader.sanitize(relativePath: "正常 文件夹/文件.txt") ?? "",
+        "正常 文件夹/文件.txt",
+        "正常相对路径原样返回"
+    )
+}
+
+run("整盘内容：转成界面用的树（文件夹在前、大小对得上）") {
+    var content = DiscContentView()
+    content.files = [
+        DiscContentFile(relativePath: "文件.txt", extent: 10, size: 100),
+        DiscContentFile(relativePath: "资料/图片.png", extent: 20, size: 2048),
+        DiscContentFile(relativePath: "资料/子目录/深层.txt", extent: 30, size: 5),
+    ]
+    content.directories = ["资料"]
+    content.sessions = [0, 2512]
+    content.fromLastSessionOnly = false
+    content.totalBytes = 2153
+
+    let tree = content.asDiscContents(source: "/dev/disk4", volumeName: "TEST")
+    expectEqual(tree.entries.map { $0.name }, ["资料", "文件.txt"], "文件夹排在前面")
+    expectEqual(tree.fileCount, 3, "文件数")
+    expectEqual(tree.directoryCount, 2, "文件夹数（含自动补出来的子目录）")
+    expectEqual(tree.totalBytes, 2153, "总字节数")
+    expectEqual(tree.sessionCount, 2, "区段数带过去")
+    expectEqual(tree.source, "/dev/disk4", "来源")
+    expectEqual(tree.volumeName, "TEST", "卷标")
+    let folder = tree.entries.first
+    expectEqual(folder?.children.map { $0.name }, ["子目录", "图片.png"], "文件夹里同样文件夹在前")
+    expectEqual(
+        folder?.children.last?.relativePath,
+        "资料/图片.png",
+        "子目录里的文件路径"
+    )
+    expectEqual(folder?.children.last?.byteCount, 2048, "子目录里的文件大小")
+    expectEqual(
+        folder?.children.first?.children.first?.relativePath,
+        "资料/子目录/深层.txt",
+        "补出来的两级目录"
+    )
+    expectEqual(folder?.children.first?.children.first?.byteCount, 5, "深层文件大小")
+    expect(folder?.isDirectory == true, "文件夹标记")
+    expectEqual(DiscContentView.parentPaths(of: "a/b/c.txt"), ["a/b", "a"], "上级路径从下往上")
+}
+
+run("整盘合并重刻：旧盘内容 + 这次新加的合成一份，单段刻完三边看到的一样") {
+    guard let engine = graftEngine() else {
+        print("  · 跳过：没装 xorriso / mkisofs")
+        return
+    }
+    let folder = try makeTempDirectory("merge-rewrite")
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    // 先做一张两段的旧盘：第二段嫁接在第一段后面，所以第二段里含第一段的全部文件。
+    let first = folder.appendingPathComponent("第一段", isDirectory: true)
+    try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+    try "第一段内容".write(to: first.appendingPathComponent("说明.txt"), atomically: true, encoding: .utf8)
+    let s1 = folder.appendingPathComponent("s1.iso")
+    try buildSession(source: first, output: s1, volumeName: "S1", graft: nil)
+
+    let next = 2512
+    let second = folder.appendingPathComponent("第二段", isDirectory: true)
+    try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+    try "第二段内容".write(to: second.appendingPathComponent("追加说明.txt"), atomically: true, encoding: .utf8)
+    let s2 = folder.appendingPathComponent("s2.iso")
+    let target = AppendTarget(devicePath: s1.path, lastSessionStart: 0, nextWritableAddress: next, oldFileCount: 1)
+    try engine.buildImage(source: second, outputURL: s2, options: ImageOptions(volumeName: "S2"), graft: target)
+
+    var disc = [UInt8](try Data(contentsOf: s1))
+    disc += [UInt8](repeating: 0, count: max(0, next * 2048 - disc.count))
+    disc += [UInt8](try Data(contentsOf: s2))
+    let discReader = IsoImageReader(data: Data(disc))
+    let layout = DiscLayout(
+        tracks: [],
+        sessionStarts: [0, next],
+        nextWritableAddress: next + 2048,
+        recordedSessions: 2
+    )
+    guard let view = DiscContentReader.read(reader: discReader, layout: layout) else {
+        expect(false, "应该能读出整盘内容")
+        return
+    }
+
+    // 第一步：这次要新加的内容先摆进「待刻目录」，盘上内容再按「已存在就跳过」并进来。
+    let staging = folder.appendingPathComponent("待刻目录", isDirectory: true)
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+    try "这次新加的".write(to: staging.appendingPathComponent("说明.txt"), atomically: true, encoding: .utf8)
+    try "这次新加的 2".write(to: staging.appendingPathComponent("新内容.txt"), atomically: true, encoding: .utf8)
+    let summary = try DiscContentReader.extract(
+        view,
+        reader: discReader,
+        source: "自检映像",
+        to: staging,
+        conflict: .skipExisting
+    )
+    expectEqual(summary.skipped, 1, "同名文件保留这次新加的")
+    expectEqual(summary.files, 1, "盘上独有的那个文件并进来")
+
+    // 第二步：合并后按「单段」刻一张新盘——擦盘那步在真机上，这里只验数据。
+    let merged = folder.appendingPathComponent("合并.iso")
+    try buildSession(source: staging, output: merged, volumeName: "MERGED", graft: nil)
+    guard let reread = IsoImageReader(fileURL: merged) else {
+        expect(false, "合并后的映像应该能打开")
+        return
+    }
+    guard let single = DiscContentReader.read(
+        reader: reread,
+        layout: DiscLayout(tracks: [], sessionStarts: [0], nextWritableAddress: 0, recordedSessions: 1)
+    ) else {
+        expect(false, "合并后的单段映像应该读得出内容")
+        return
+    }
+    expectEqual(
+        single.files.map { $0.relativePath }.sorted(),
+        ["新内容.txt", "追加说明.txt", "说明.txt"].sorted(),
+        "合并后每个文件都在这唯一的一段里"
+    )
+    let out = folder.appendingPathComponent("回读", isDirectory: true)
+    _ = try DiscContentReader.extract(single, reader: reread, source: "合并映像", to: out)
+    expectEqual(
+        try String(contentsOf: out.appendingPathComponent("说明.txt"), encoding: .utf8),
+        "这次新加的",
+        "同名文件是这次新加的那一份"
+    )
+    expectEqual(
+        try String(contentsOf: out.appendingPathComponent("追加说明.txt"), encoding: .utf8),
+        "第二段内容",
+        "旧盘上的文件原样保留"
+    )
+    expectEqual(
+        try String(contentsOf: out.appendingPathComponent("新内容.txt"), encoding: .utf8),
+        "这次新加的 2",
+        "新文件也在"
+    )
+}
+
+run("追加策略：默认是嫁接，合并重刻要显式选") {
+    expectEqual(BurnOptions().appendStrategy, .graft, "默认嫁接（写得快，但 macOS / Linux 只看得到第一段）")
+    expectEqual(BurnOptions(appendStrategy: .rewriteMerged).appendStrategy, .rewriteMerged, "可以选合并重刻")
+    expectEqual(AppendStrategy(rawValue: "rewriteMerged"), .rewriteMerged, "存 UserDefaults 用的原始值")
+    expectEqual(AppendStrategy(rawValue: "graft"), .graft, "存 UserDefaults 用的原始值")
+}
+
 print("")
 if failureCount == 0 {
     print("全部 \(checkCount) 项检查通过 ✅")

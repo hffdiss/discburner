@@ -76,21 +76,21 @@ struct DiscBrowserPanel: View {
                     .truncationMode(.middle)
             }
             Spacer()
-            if model.discContentsLoading {
+            if model.discContentsLoading || model.discWholeContentLoading {
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle())
                     .scaleEffect(0.5)
                     .frame(width: 16, height: 16)
             }
             Button {
-                model.loadDiscContents(allowMount: false)
+                model.reloadDiscContents()
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
             .buttonStyle(PlainButtonStyle())
             .foregroundColor(.accentColor)
             .help("重新读取光盘内容")
-            .disabled(model.discContentsLoading || !model.status.isPresent)
+            .disabled(model.discContentsLoading || model.discWholeContentLoading || !model.status.isPresent)
 
             Button {
                 model.showDiscContents = true
@@ -120,24 +120,43 @@ struct DiscBrowserPanel: View {
         if let sessions = model.status.sessions, sessions > 0 {
             parts.append("共 \(sessions) 个区段")
         }
-        if let contents = model.discContents, !contents.entries.isEmpty {
+        if let contents = displayContents, !contents.entries.isEmpty {
             if let volume = contents.volumeName { parts.append(volume) }
             parts.append(contents.shortSummary)
-        } else if model.discContentsLoading {
+        } else if model.discContentsLoading || model.discWholeContentLoading {
             parts.append("正在读取…")
-        } else if model.discContents == nil {
+        } else if displayContents == nil {
             parts.append("尚未读取")
         }
         return parts.joined(separator: " · ")
+    }
+
+    /// 优先显示按扇区读出来的「整盘内容」：系统只挂载多区段盘的其中一段，
+    /// 直接显示挂载结果会让用户以为盘上少了东西。
+    private var displayContents: DiscContents? {
+        if let whole = model.discWholeContent, !whole.entries.isEmpty { return whole }
+        return model.discContents
+    }
+
+    /// 现在显示的是不是原始扇区读出来的完整内容（而不是系统挂载的那一段）。
+    private var showingWholeDisc: Bool {
+        model.discWholeContent?.entries.isEmpty == false
     }
 
     // MARK: - 列表
 
     @ViewBuilder
     private var content: some View {
-        if let contents = model.discContents, !contents.entries.isEmpty {
+        if let contents = displayContents, !contents.entries.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
-                if let sessions = contents.sessionCount, sessions > 1 {
+                if showingWholeDisc {
+                    Text("这张盘共有 \(contents.sessionCount ?? 1) 个区段；下面是按扇区读出来的整盘内容（含全部区段），不是系统挂载的那一段。")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 6)
+                } else if let sessions = contents.sessionCount, sessions > 1 {
                     Text("这张盘共有 \(sessions) 个区段，系统每次只挂载其中一段；这里显示的是系统当前挂载的那一段，其余区段看「本机刻录记录」。")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
@@ -183,7 +202,7 @@ struct DiscBrowserPanel: View {
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            } else if let note = model.discContents?.note {
+            } else if let note = displayContents?.note {
                 Text(note)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)

@@ -349,6 +349,19 @@ struct ContentView: View {
                         .foregroundColor(model.speedExplanationIsWarning ? .orange : .secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
+                    if model.canMergeBeforeBurn {
+                        Toggle(isOn: $model.mergeBeforeBurn) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("整盘合并重刻")
+                                Text("追加时先读盘上旧内容，擦盘后单段刻完；不勾就只追加一段（macOS / Linux 默认只看得到第一段）。")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .disabled(model.isBusy)
+                    }
+
                     if let notice = model.appendNotice {
                         Text(notice.text)
                             .font(.system(size: 10))

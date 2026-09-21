@@ -55,7 +55,7 @@ public struct DiscContents {
         if directoryCount > 0 { text += "、\(directoryCount) 个文件夹" }
         text += " · \(size)"
         if let sessions = sessionCount, sessions > 1 {
-            text += " · 共 \(sessions) 个区段（此处为系统挂载的那一段）"
+            text += " · 共 \(sessions) 个区段（系统挂载只会显示其中一段）"
         }
         return text
     }

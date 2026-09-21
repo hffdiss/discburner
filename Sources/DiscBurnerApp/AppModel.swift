@@ -114,6 +114,12 @@ final class AppModel: ObservableObject {
 
     @Published var showLog = false
     @Published var discContents: DiscContents?
+    /// 按扇区读出来的「整盘内容」（多区段盘的每一段都在里面）。
+    ///
+    /// 系统只挂载多区段盘的其中一段，所以「光盘里已有的内容」栏优先显示这一份，
+    /// 免得界面显示的内容和盘上真正有的内容对不上。读的是目录结构，不是文件内容，很快。
+    @Published var discWholeContent: DiscContents?
+    @Published var discWholeContentLoading = false
     @Published var discContentsLoading = false
     @Published var discContentsError: String?
     @Published var showDiscContents = false
@@ -143,10 +149,20 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(sanitizeNames, forKey: AppModel.sanitizeNamesKey) }
     }
 
+    /// 往「已经有内容的盘」上刻的时候，是不是「整盘合并重刻」。
+    ///
+    /// 默认打开：追加刻录出来的盘，macOS / Linux 默认只看得到第一段（Windows 反而正常），
+    /// 合并重刻才能保证三边看到的都是同一份完整内容。只对可重写介质有意义。
+    @Published var mergeBeforeBurn: Bool =
+        (UserDefaults.standard.object(forKey: AppModel.mergeBeforeBurnKey) as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(mergeBeforeBurn, forKey: AppModel.mergeBeforeBurnKey) }
+    }
+
     static let sanitizeNamesKey = "DiscBurner.sanitizeNames"
     static let showDiscBrowserKey = "DiscBurner.showDiscBrowser"
     static let speedChoiceKey = "DiscBurner.speedChoice"
     static let appearanceKey = "DiscBurner.appearance"
+    static let mergeBeforeBurnKey = "DiscBurner.mergeBeforeBurn"
 
     private var job: BurnJob?
     private var pollTimer: Timer?
@@ -267,11 +283,42 @@ final class AppModel: ObservableObject {
 
     enum BurnNoticeLevel { case info, warning, error }
 
+    /// 「整盘合并重刻」这次用不用得上：盘上已经有内容，而且这张盘擦得掉。
+    var canMergeBeforeBurn: Bool {
+        guard status.isPresent, let sessions = status.sessions, sessions > 0, status.canBurn else { return false }
+        return demoRewritable || status.erasable || status.media.isRewritable
+    }
+
+    /// 截屏 / 排错用：把「这张盘可重写」当成真的（`--demo-rewritable`）。
+    /// 只影响界面上的判断，不会去擦任何盘。
+    var demoRewritable = false
+
+    /// 这次刻录会不会走「整盘合并重刻」。
+    var willMergeWholeDisc: Bool { mergeBeforeBurn && canMergeBeforeBurn }
+
+    /// Linux 上要读「第一段以外」的区段，只能自己指定段起始扇区。
+    ///
+    /// Linux 内核的 isofs 靠光驱回应的 TOC 判断「最后一段从哪开始」，很多 USB 光驱对
+    /// DVD+R 这类介质只回一条轨道，内核就退回第一段——盘上数据没坏，是读的一方挑错了段。
+    var linuxMountCommand: String? {
+        guard let start = discLayout.lastSessionStart else { return nil }
+        return "sudo mount -t iso9660 -o ro,sbsector=\(start) /dev/sr0 /mnt"
+    }
+
     /// 追加刻录这一行的说明：会不会合并旧内容、缺不缺工具、旧盘兼不兼容。
     var appendNotice: (text: String, level: BurnNoticeLevel)? {
         guard status.isPresent, let sessions = status.sessions, sessions > 0, status.canBurn else { return nil }
         if closeDisc {
             return ("这次会关闭光盘：刻完之后不能再往这张盘里加内容。", .info)
+        }
+        // 合并重刻不嫁接，所以「读不到区段」「工具不支持嫁接」这些限制都不适用。
+        if willMergeWholeDisc {
+            return (
+                "整盘合并重刻：先把盘上已有的 \(sessions) 段内容读出来，和这次要刻的合成一份，"
+                    + "擦掉盘再单段刻完。Windows / macOS / Linux 看到的都是这一份完整内容。"
+                    + "\n代价是慢：盘上内容要先整个读一遍，再整盘写一遍。",
+                .info
+            )
         }
         if discLayout.isEmpty {
             return ("盘上已经有 \(sessions) 段内容，但读不到区段信息，现在无法追加。", .warning)
@@ -292,9 +339,22 @@ final class AppModel: ObservableObject {
                 .warning
             )
         }
+        var appendText =
+            "追加模式：新内容接在第 \(discLayout.recordedSessions + 1) 段，合并盘上已有 "
+            + "\(discLayout.recordedSessions) 段内容。"
+        appendText += "\n⚠︎ 追加出来的盘 Windows 上正常，但 macOS / Linux 默认只看得到第一段（旧内容还在盘上，"
+            + "只是读的一方挑了旧的那一段）。"
+        if canMergeBeforeBurn {
+            appendText += "\n勾上「整盘合并重刻」就能让三边都看到全部内容。"
+        } else {
+            appendText += "一次性介质擦不掉，只能换可重写介质（DVD±RW / BD-RE）合并重刻。"
+        }
+        if let command = linuxMountCommand {
+            appendText += "\n在 Linux 上临时读全部内容：\(command)"
+        }
         return (
-            "追加模式：新内容接在第 \(discLayout.recordedSessions + 1) 段，合并盘上已有 \(discLayout.recordedSessions) 段内容。",
-            .info
+            appendText,
+            .warning
         )
     }
 
@@ -419,8 +479,15 @@ final class AppModel: ObservableObject {
     func burnSummary() -> String {
         let size = ByteText.human(totalBytes)
         let media = status.isPresent ? status.media.displayName : "未知介质"
-        let extra = testBurn ? "\n测试模式不会写入介质，只验证流程。" : ""
-        return "把 \(items.count) 个项目（\(size)）刻录到 \(media)，卷标「\(volumeName)」。\n刻录速度：\(speedSummaryLine)\(extra)"
+        var text = "把 \(items.count) 个项目（\(size)）刻录到 \(media)，卷标「\(volumeName)」。"
+        if willMergeWholeDisc {
+            text += "\n追加方式：整盘合并重刻——先读盘上已有内容，擦除后单段刻完（Windows / macOS / Linux 都能看到全部内容）。"
+        } else if status.isPresent, let sessions = status.sessions, sessions > 0, status.canBurn {
+            text += "\n追加方式：追加写入第 \(sessions + 1) 段（macOS / Linux 默认只看得到第一段）。"
+        }
+        text += "\n刻录速度：\(speedSummaryLine)"
+        if testBurn { text += "\n测试模式不会写入介质，只验证流程。" }
+        return text
     }
 
     /// 确认单里的速度一行。
@@ -443,6 +510,9 @@ final class AppModel: ObservableObject {
         guard !isRefreshing else { return }
         isRefreshing = true
         let preferred = selectedDriveIndex
+        // 判断旧段兼不兼容要读原始扇区，很费光驱；区段布局没变就沿用上次的结论。
+        let previousChainKey = chainKey
+        let previousChain = discChainState
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var drives: [OpticalDrive] = []
             var status = DiscStatus()
@@ -450,6 +520,7 @@ final class AppModel: ObservableObject {
             var effectiveIndex: Int?
             var layout = DiscLayout.empty
             var chain = DiscChainState.unknown
+            var newChainKey: String?
             do {
                 drives = try DriveService.listDrives()
                 let index = drives.contains(where: { $0.index == preferred }) ? preferred : drives.first?.index
@@ -459,7 +530,13 @@ final class AppModel: ObservableObject {
                     if status.isPresent, (status.sessions ?? 0) > 0 {
                         layout = (try? Multisession.layout(driveIndex: index)) ?? .empty
                         if let device = status.deviceNode, !layout.isEmpty {
-                            chain = Multisession.chainState(deviceNode: device, layout: layout)
+                            let key = Self.chainKey(for: device, layout: layout)
+                            if key == previousChainKey {
+                                chain = previousChain
+                            } else {
+                                chain = Multisession.chainState(deviceNode: device, layout: layout)
+                                newChainKey = key
+                            }
                         }
                     }
                 }
@@ -474,10 +551,18 @@ final class AppModel: ObservableObject {
                 self.status = status
                 self.discLayout = layout
                 self.discChainState = chain
+                if let key = newChainKey { self.chainKey = key }
                 self.statusError = failure
                 self.autoRefreshDiscContentsIfNeeded()
             }
         }
+    }
+
+    /// 「旧段可合并性」判据的缓存键：设备 + 区段布局，都没变就不用再读一次盘。
+    private var chainKey: String?
+
+    private static func chainKey(for device: String, layout: DiscLayout) -> String {
+        "\(device)|\(layout.lastSessionStart ?? -1)|\(layout.nextWritableAddress ?? -1)|\(layout.recordedSessions)"
     }
 
     /// 换盘后自动读取内容——但只在系统已经挂载的情况下做，
@@ -492,9 +577,42 @@ final class AppModel: ObservableObject {
         guard fingerprint != lastMediaFingerprint else { return }
         lastMediaFingerprint = fingerprint
         discContents = nil
+        discWholeContent = nil
         discContentsError = nil
         burnHistory = BurnHistory.records(mediaID: status.mediaID, limit: 10)
         guard status.isPresent else { return }
+        loadDiscWholeContent()
+        loadDiscContents(allowMount: false)
+    }
+
+    /// 按扇区读「整盘内容」（多区段盘的每一段都在里面）。
+    ///
+    /// 只在**换盘 / 刻完之后**读，不跟着 6 秒轮询走：原始设备读要光驱真去转盘，
+    /// 这台 USB 光驱在这种持续读盘下容易掉总线，而且内容只有刻完才会变。
+    func loadDiscWholeContent() {
+        guard status.isPresent, discWholeContentLoading == false else { return }
+        guard let device = status.deviceNode, !device.isEmpty, !discLayout.isEmpty else {
+            discWholeContent = nil
+            return
+        }
+        let media = status.media
+        let mediaID = status.mediaID
+        let layout = discLayout
+        discWholeContentLoading = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let whole = DiscContentReader.read(deviceNode: device, layout: layout)?
+                .asDiscContents(source: device, media: media, mediaID: mediaID)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.discWholeContentLoading = false
+                self.discWholeContent = (whole?.entries.isEmpty == false) ? whole : nil
+            }
+        }
+    }
+
+    /// 两个来源一起重读：按扇区读的整盘内容 + 系统挂载的那一段（拿卷标 / 文件系统名）。
+    func reloadDiscContents() {
+        loadDiscWholeContent()
         loadDiscContents(allowMount: false)
     }
 
@@ -554,7 +672,8 @@ final class AppModel: ObservableObject {
             ejectWhenDone: ejectWhenDone,
             testBurn: testBurn,
             closeDisc: closeDisc,
-            eraseFirst: false
+            eraseFirst: false,
+            appendStrategy: willMergeWholeDisc ? .rewriteMerged : .graft
         )
         return BurnRequest(
             items: items.map { $0.url },
@@ -660,6 +779,10 @@ final class AppModel: ObservableObject {
                     }
                 }
                 self.refresh()
+                // 刻完盘上内容就变了，等状态刷回来再按扇区重读一遍整盘内容。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    self?.loadDiscWholeContent()
+                }
             }
         }
     }
@@ -709,6 +832,9 @@ final class AppModel: ObservableObject {
                     self.finishedMessage = "光盘已擦除，可以重新刻录。"
                 }
                 self.refresh()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    self?.loadDiscWholeContent()
+                }
             }
         }
     }

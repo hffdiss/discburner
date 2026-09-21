@@ -16,8 +16,8 @@ struct DiscContentsView: View {
         }
         .frame(minWidth: 620, idealWidth: 680, minHeight: 460, idealHeight: 540)
         .onAppear {
-            if model.discContents == nil {
-                model.loadDiscContents(allowMount: false)
+            if model.discContents == nil, model.discWholeContent == nil {
+                model.reloadDiscContents()
             }
         }
     }
@@ -28,24 +28,24 @@ struct DiscContentsView: View {
                 .font(.system(size: 22))
                 .foregroundColor(.accentColor)
             VStack(alignment: .leading, spacing: 2) {
-                Text(model.discContents?.volumeName ?? "光盘内容")
+                Text(displayContents?.volumeName ?? "光盘内容")
                     .font(.system(size: 15, weight: .semibold))
                 Text(subtitle)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
             }
             Spacer()
-            if model.discContentsLoading {
+            if model.discContentsLoading || model.discWholeContentLoading {
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle())
                     .scaleEffect(0.7)
             }
             Button {
-                model.loadDiscContents(allowMount: false)
+                model.reloadDiscContents()
             } label: {
                 Label("重新读取", systemImage: "arrow.clockwise")
             }
-            .disabled(model.discContentsLoading || model.status.deviceNode == nil)
+            .disabled(model.discContentsLoading || model.discWholeContentLoading || model.status.deviceNode == nil)
         }
         .padding(14)
     }
@@ -53,7 +53,7 @@ struct DiscContentsView: View {
     private var subtitle: String {
         guard model.status.isPresent else { return "未插入光盘" }
         var parts: [String] = [model.status.media.displayName]
-        if let contents = model.discContents {
+        if let contents = displayContents {
             if let sessions = contents.sessionCount, sessions > 1 {
                 parts.append("共 \(sessions) 个区段")
             }
@@ -66,13 +66,27 @@ struct DiscContentsView: View {
         return parts.joined(separator: " · ")
     }
 
+    /// 优先显示按扇区读出来的整盘内容：系统只挂载多区段盘的其中一段。
+    private var displayContents: DiscContents? {
+        if let whole = model.discWholeContent, !whole.entries.isEmpty { return whole }
+        return model.discContents
+    }
+
     private var content: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                if let note = model.discContents?.note {
+                if let note = displayContents?.note {
                     Text(note)
                         .font(.system(size: 11))
                         .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if model.discWholeContent?.entries.isEmpty == false,
+                   let sessions = model.discWholeContent?.sessionCount, sessions > 1 {
+                    Text("这是按扇区读出来的整盘内容（含全部 \(sessions) 个区段）。"
+                        + "macOS / Linux 的系统挂载默认只看得到第一段，所以磁盘工具 / 访达里看到的内容可能比这里少。")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if let error = model.discContentsError {
@@ -90,9 +104,9 @@ struct DiscContentsView: View {
                             .foregroundColor(.secondary)
                     }
                 }
-                if let contents = model.discContents, !contents.entries.isEmpty {
+                if let contents = displayContents, !contents.entries.isEmpty {
                     fileList(contents)
-                } else if model.discContentsLoading {
+                } else if model.discContentsLoading || model.discWholeContentLoading {
                     HStack(spacing: 8) {
                         ProgressView().progressViewStyle(CircularProgressViewStyle()).scaleEffect(0.6)
                         Text("正在读取光盘内容…").font(.system(size: 12)).foregroundColor(.secondary)

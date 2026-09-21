@@ -12,6 +12,21 @@ public enum EraseMode: String {
     }
 }
 
+/// 往「已经有内容的盘」上刻的时候，旧内容怎么处理。
+///
+/// 多区段光盘每一段都是一份独立卷，Windows 靠光盘 TOC 找到最后一段，所以看得到全部内容；
+/// 但 macOS 的 cd9660 驱动根本不认多区段，Linux 也只在光驱能把「最后一段起始」告诉内核时
+/// 才读最后一段——两边默认都退回第一段。也就是说：**追加刻录出来的盘，旧内容在 macOS /
+/// Linux 上是看不到的**，这不是数据写坏了，而是读的一方挑了旧的那一段。
+public enum AppendStrategy: String {
+    /// 嫁接到新段（默认）：写得快、不擦盘，但 macOS / Linux 默认只看得到第一段。
+    case graft = "graft"
+    /// 整盘合并重刻：先把盘上已有内容读出来，和这次要刻的合成一份，擦掉盘再单段刻完。
+    /// 慢（要读一遍、写一遍），但 Windows / macOS / Linux 看到的永远是同一份完整内容。
+    /// 只对可重写介质（DVD±RW / BD-RE 等）有意义。
+    case rewriteMerged = "rewriteMerged"
+}
+
 public struct BurnOptions {
     /// 指定驱动器序号（`drutil list` 里的编号），nil 表示使用默认驱动器。
     public var driveIndex: Int?
@@ -27,6 +42,8 @@ public struct BurnOptions {
     public var closeDisc: Bool
     /// 刻录前先擦除介质（仅对可重写介质有效）。
     public var eraseFirst: Bool
+    /// 盘上已经有内容时，这次是嫁接新段还是整盘合并重刻。
+    public var appendStrategy: AppendStrategy
 
     public init(
         driveIndex: Int? = nil,
@@ -35,7 +52,8 @@ public struct BurnOptions {
         ejectWhenDone: Bool = true,
         testBurn: Bool = false,
         closeDisc: Bool = false,
-        eraseFirst: Bool = false
+        eraseFirst: Bool = false,
+        appendStrategy: AppendStrategy = .graft
     ) {
         self.driveIndex = driveIndex
         self.speed = speed
@@ -44,6 +62,7 @@ public struct BurnOptions {
         self.testBurn = testBurn
         self.closeDisc = closeDisc
         self.eraseFirst = eraseFirst
+        self.appendStrategy = appendStrategy
     }
 }
 
@@ -255,6 +274,8 @@ public enum BurnError: LocalizedError {
     case noItems
     /// 盘上已经有内容、需要多区段嫁接，但机器上没有能做嫁接的映像工具。
     case appendNeedsIsoTool
+    /// 选了「整盘合并重刻」，但这张盘擦不掉（一次性介质）。
+    case mergeNeedsRewritable(String)
     /// 盘是用旧版本刻的（每段各自独立寻址），接上去只会让旧内容消失。
     case appendIncompatibleDisc(sessions: Int)
     case unexpected(String)
@@ -275,6 +296,10 @@ public enum BurnError: LocalizedError {
             return "当前介质（\(media)）不支持擦除，只有 CD-RW / DVD-RW / DVD+RW / DVD-RAM / BD-RE 可以擦除。"
         case .noItems:
             return "还没有选择要刻录的文件。"
+        case .mergeNeedsRewritable(let media):
+            return "「整盘合并重刻」需要擦得掉的介质，当前是 \(media)（一次性介质，刻上去就擦不掉了）。\n"
+                + "换一张 DVD+RW / DVD-RW / BD-RE 就能合并重刻；"
+                + "或者改用「追加写入」，但要知道：追加出来的盘在 macOS / Linux 上默认只看得到第一段。"
         case .appendNeedsIsoTool:
             return "追加刻录要把新内容嫁接在旧区段后面（系统自带的 hdiutil 做不到这件事）。\n"
                 + "先在终端执行 `brew install xorriso`（已经装了 cdrtools 的话 `\(Mkisofs.recommendedTool)` 更好）再试；"

@@ -65,6 +65,10 @@ func usage() {
       --test               测试模式（不打开激光，不写入介质）
       --erase-first        刻录前先快速擦除（仅可重写介质）
       --close              关闭光盘，之后无法再追加
+      --merge              可重写介质上追加时「整盘合并重刻」：先读盘上已有内容，
+                           和这次要刻的合成一份，擦盘再单段刻完。
+                           保证 Windows / macOS / Linux 看到的是同一份完整内容
+      --append             追加新段（默认）：写得快，但 macOS / Linux 默认只看得到第一段
       --keep-junk          保留 .DS_Store 等 macOS 垃圾文件
       --fix-names          自动重命名不兼容的文件名（只改光盘里的副本）
       --strict             有兼容性问题就中止，不开始刻录
@@ -95,6 +99,8 @@ struct Options {
     var test = false
     var eraseFirst = false
     var closeDisc = false
+    /// 盘上已经有内容时：追加新段（默认）还是整盘合并重刻。
+    var appendStrategy: AppendStrategy = .graft
     var keepJunk = false
     var force = false
     var keep = false
@@ -210,6 +216,10 @@ func parse(_ arguments: [String]) throws -> Options {
             options.eraseFirst = true
         case "--close":
             options.closeDisc = true
+        case "--merge":
+            options.appendStrategy = .rewriteMerged
+        case "--append":
+            options.appendStrategy = .graft
         case "--keep-junk":
             options.keepJunk = true
         case "--force", "-f":
@@ -514,7 +524,8 @@ func runJob(_ options: Options, output: URL?) throws {
             ejectWhenDone: options.eject,
             testBurn: options.test,
             closeDisc: options.closeDisc,
-            eraseFirst: options.eraseFirst
+            eraseFirst: options.eraseFirst,
+            appendStrategy: options.appendStrategy
         ),
         imageOnlyURL: output,
         stageOptions: StageOptions(
@@ -722,12 +733,36 @@ func commandContents(options: Options) throws {
             throw BurnError.unexpected("系统没有报告光盘设备节点")
         }
         print(bold("[读取光盘] ") + "\(device)  \(status.media.displayName)")
-        contents = try DiscReader.readDevice(
-            device,
-            media: status.media,
-            mediaID: status.mediaID,
-            sessionCount: status.sessions
-        )
+        // 优先按扇区读「整盘内容」：多区段盘系统只挂载其中一段，
+        // 只看挂载结果会少显示内容——「追加刻录后看不到文件」最容易踩的就是这个坑。
+        let layout = (try? Multisession.layout(driveIndex: drive.index)) ?? .empty
+        if !layout.isEmpty,
+           let whole = DiscContentReader.read(deviceNode: device, layout: layout) {
+            contents = whole.asDiscContents(source: device, media: status.media, mediaID: status.mediaID)
+            if layout.recordedSessions > 1 {
+                contents.note = "这张盘是多区段盘：系统挂载只会显示其中一段，"
+                    + "上面列的是按扇区读出来的全部 \(layout.recordedSessions) 个区段。"
+            }
+            // 卷标 / 文件系统名挂载着才拿得到，能补就补上。
+            if let mounted = try? DiscReader.readDevice(
+                device,
+                media: status.media,
+                mediaID: status.mediaID,
+                sessionCount: status.sessions,
+                allowMount: false
+            ) {
+                contents.volumeName = contents.volumeName ?? mounted.volumeName
+                contents.fileSystem = contents.fileSystem ?? mounted.fileSystem
+                contents.mountPoint = mounted.mountPoint
+            }
+        } else {
+            contents = try DiscReader.readDevice(
+                device,
+                media: status.media,
+                mediaID: status.mediaID,
+                sessionCount: status.sessions
+            )
+        }
     }
 
     print("")
