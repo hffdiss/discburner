@@ -7,9 +7,12 @@ struct FileItem: Identifiable, Hashable {
     let url: URL
     let isDirectory: Bool
     let byteCount: Int64
+    /// 音乐 CD 模式下这条音轨的时长（秒）；数据光盘模式不用。
+    var duration: TimeInterval = 0
 
     var name: String { url.lastPathComponent }
     var sizeText: String { isDirectory ? ByteText.human(byteCount) + "/" : ByteText.human(byteCount) }
+    var durationText: String { duration > 0 ? AudioDisc.timeText(duration) : "—" }
 }
 
 enum FileSystemPreset: Int, CaseIterable, Identifiable {
@@ -45,6 +48,8 @@ struct BurnPrep: Identifiable {
     let id = UUID()
     let report: CompatibilityReport
     let summary: String
+    /// 音乐 CD 的确认单：不展示文件名兼容性（盘上没有文件名）。
+    var isAudio: Bool = false
 
     var hasIssues: Bool { !report.isPerfect }
     var hasErrors: Bool { report.hasErrors }
@@ -78,6 +83,25 @@ enum SpeedChoice: Hashable {
 final class AppModel: ObservableObject {
     @Published var items: [FileItem] = []
     @Published var volumeName: String = AppModel.defaultVolumeName()
+    /// 音乐 CD 模式下「刚才加了什么、跳过了什么」的一句话提示。
+    @Published var audioSkipNotice: String?
+    /// 刻数据光盘还是音乐 CD。两种盘的写盘方式完全不同，界面也跟着换一套说法。
+    @Published var mode: DiscMode =
+        DiscMode(rawValue: UserDefaults.standard.string(forKey: AppModel.discModeKey) ?? "") ?? .data {
+        didSet {
+            guard oldValue != mode else { return }
+            if persistModeChanges {
+                UserDefaults.standard.set(mode.rawValue, forKey: AppModel.discModeKey)
+            }
+            if mode == .audioCD {
+                filterItemsToAudio()
+            }
+            scheduleCompatibilityScan()
+        }
+    }
+
+    /// 截屏参数（`--demo-audio`）切模式时不写 UserDefaults，免得改掉用户真实的选择。
+    var persistModeChanges = true
     @Published var preset: FileSystemPreset = .universal {
         didSet { scheduleCompatibilityScan() }
     }
@@ -166,6 +190,7 @@ final class AppModel: ObservableObject {
     static let speedChoiceKey = "DiscBurner.speedChoice"
     static let appearanceKey = "DiscBurner.appearance"
     static let mergeBeforeBurnKey = "DiscBurner.mergeBeforeBurn"
+    static let discModeKey = "DiscBurner.discMode"
 
     private var job: BurnJob?
     private var pollTimer: Timer?
@@ -200,20 +225,66 @@ final class AppModel: ObservableObject {
     }
 
     var capacityBytes: Int64? {
-        status.writableBytes
+        // 音乐 CD 按时间算容量，不按字节。
+        mode == .audioCD ? nil : status.writableBytes
     }
 
     var isOverCapacity: Bool {
+        if mode == .audioCD { return isAudioOverCapacity }
         guard let capacity = capacityBytes, capacity > 0 else { return false }
         return totalBytes > capacity
     }
 
     var usageFraction: Double {
+        if mode == .audioCD { return audioUsageFraction }
         guard let capacity = capacityBytes, capacity > 0 else { return 0 }
         return min(1, Double(totalBytes) / Double(capacity))
     }
 
+    // MARK: - 音乐 CD 的时长
+
+    /// 所有音轨的时长合计。
+    var audioTotalDuration: TimeInterval {
+        items.reduce(0) { $0 + $1.duration }
+    }
+
+    /// 算上每轨前后 2 秒间隔后，这张盘要占用的时间。
+    var audioRequiredSeconds: Double {
+        guard !items.isEmpty else { return 0 }
+        return audioTotalDuration + AudioDisc.gapSeconds * Double(items.count + 1)
+    }
+
+    var audioCapacitySeconds: Double { AudioDisc.capacitySeconds }
+    var audioRemainingSeconds: Double { audioCapacitySeconds - audioRequiredSeconds }
+    var isAudioOverCapacity: Bool {
+        !items.isEmpty && audioRequiredSeconds > audioCapacitySeconds
+    }
+
+    var audioUsageFraction: Double {
+        guard items.count > 0 else { return 0 }
+        return min(1, audioRequiredSeconds / audioCapacitySeconds)
+    }
+
+    /// 转成 CD 音轨后的大致字节数（估刻录耗时、显示「要多少临时空间」用）。
+    var audioPayloadBytes: Int64 {
+        items.reduce(Int64(0)) { $0 + AudioDisc.pcmBytes(duration: $1.duration) }
+    }
+
+    /// 估算刻录耗时用的字节数：数据盘是文件大小，音乐 CD 是转码后的音轨大小。
+    var payloadBytesForEstimate: Int64 {
+        mode == .audioCD ? audioPayloadBytes : totalBytes
+    }
+
+    /// 还有音轨的时长没读出来（`afinfo` 正在后台跑）。
+    var audioDurationsPending: Bool {
+        mode == .audioCD && items.contains { $0.duration <= 0 }
+    }
+
     func add(urls: [URL]) {
+        if mode == .audioCD {
+            addAudio(urls: urls)
+            return
+        }
         var known = Set(items.map { $0.url.standardizedFileURL.path })
         var added: [FileItem] = []
         for url in urls {
@@ -256,7 +327,101 @@ final class AppModel: ObservableObject {
 
     func clearItems() {
         items.removeAll()
+        audioSkipNotice = nil
         scheduleCompatibilityScan()
+    }
+
+    // MARK: - 音乐 CD 的列表
+
+    /// 音乐 CD 模式下的「添加」：文件夹摊平成音轨，非音频内容根本不进列表。
+    ///
+    /// 数据光盘是把文件夹原样刻进去，音乐 CD 没有「文件夹」这个东西——一张盘就是一条条音轨。
+    /// 所以这里先把文件夹递归摊平，用户看到的列表顺序就是盘上的音轨顺序
+    /// （暂存时按这个顺序加两位序号前缀，因为 `drutil burn -audio` 是按文件名字母序写的）。
+    private func addAudio(urls: [URL]) {
+        var known = Set(items.map { $0.url.standardizedFileURL.path })
+        var added: [FileItem] = []
+        var skipped: [String] = []
+        for url in urls {
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            let candidates: [URL]
+            if isDirectory {
+                candidates = AudioDisc.audioFiles(inDirectory: url)
+                if candidates.isEmpty { skipped.append("\(url.lastPathComponent)（文件夹里没有音频）") }
+            } else if AudioDisc.isAudioFile(url) {
+                candidates = [url]
+            } else {
+                skipped.append(url.lastPathComponent)
+                continue
+            }
+            for candidate in candidates {
+                let standardized = candidate.standardizedFileURL
+                guard !known.contains(standardized.path) else { continue }
+                known.insert(standardized.path)
+                added.append(FileItem(
+                    url: standardized,
+                    isDirectory: false,
+                    byteCount: Workspace.fileSize(of: standardized)
+                ))
+            }
+        }
+        audioSkipNotice = skipped.isEmpty ? nil : audioSkipSummary(skipped)
+        guard !added.isEmpty else { return }
+        items.append(contentsOf: added)
+        measureDurations(of: added)
+    }
+
+    private func audioSkipSummary(_ skipped: [String]) -> String {
+        let head = skipped.prefix(3).joined(separator: "、")
+        let tail = skipped.count > 3 ? " 等 \(skipped.count) 个" : ""
+        return "音乐 CD 只收音频文件，已跳过：\(head)\(tail)"
+    }
+
+    /// 读每条音轨的时长（`afinfo` 很轻，一条几十毫秒）。
+    private func measureDurations(of added: [FileItem]) {
+        guard !added.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var measured: [UUID: TimeInterval] = [:]
+            for item in added {
+                measured[item.id] = (try? AudioDisc.info(for: item.url))?.duration ?? 0
+            }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.items = self.items.map { item in
+                    guard let duration = measured[item.id] else { return item }
+                    var updated = item
+                    updated.duration = duration
+                    return updated
+                }
+            }
+        }
+    }
+
+    /// 从数据光盘切到音乐 CD 时，把列表里不是音频的内容摊平/去掉。
+    private func filterItemsToAudio() {
+        var known = Set<String>()
+        var result: [FileItem] = []
+        for item in items {
+            let candidates = item.isDirectory ? AudioDisc.audioFiles(inDirectory: item.url) : [item.url]
+            for candidate in candidates {
+                let standardized = candidate.standardizedFileURL
+                guard AudioDisc.isAudioFile(standardized) else { continue }
+                guard !known.contains(standardized.path) else { continue }
+                known.insert(standardized.path)
+                result.append(FileItem(
+                    url: standardized,
+                    isDirectory: false,
+                    byteCount: Workspace.fileSize(of: standardized)
+                ))
+            }
+        }
+        let removed = items.count - result.count
+        items = result
+        measureDurations(of: result)
+        if removed > 0 {
+            audioSkipNotice = "切到音乐 CD 后去掉了 \(removed) 个不是音频的项目"
+        }
     }
 
     // MARK: - 兼容性预检
@@ -291,6 +456,7 @@ final class AppModel: ObservableObject {
     /// 「盘上已经有内容」必须用 `Multisession.needsGraft` 判断，不能看段数——
     /// 空白盘的 `discinfo` 也会写 `Sessions: 1`（那条空白轨道）。
     var canMergeBeforeBurn: Bool {
+        guard mode == .data else { return false }
         guard status.isPresent, Multisession.needsGraft(status: status) else { return false }
         return demoRewritable || status.erasable || status.media.isRewritable
     }
@@ -313,6 +479,15 @@ final class AppModel: ObservableObject {
 
     /// 追加刻录这一行的说明：会不会合并旧内容、缺不缺工具、旧盘兼不兼容。
     var appendNotice: (text: String, level: BurnNoticeLevel)? {
+        // 音乐 CD 不能追加：盘上有内容时，这条提示取代「追加 / 合并」那一套说法。
+        if mode == .audioCD {
+            guard status.isPresent, Multisession.needsGraft(status: status) else { return nil }
+            if status.erasable || status.media.isRewritable {
+                return ("音乐 CD 不能追加刻录：刻录前会先擦除这张盘，然后再写音轨。", .warning)
+            }
+            return ("这张 \(status.media.displayName) 上已经有内容，而音乐 CD 不能追加刻录。"
+                + "请换一张空白 CD-R，或用可重写的 CD-RW 擦除后再刻。", .error)
+        }
         // 只有「盘上已经有内容、还能接着写」才有追加这回事：空白盘（哪怕是可重写盘）段数是 1，
         // 但那是空白轨道，不是已有内容。
         guard status.isPresent, Multisession.needsGraft(status: status) else { return nil }
@@ -370,7 +545,14 @@ final class AppModel: ObservableObject {
 
     /// 当前介质 + 驱动器能力 + 内容大小给出的速度建议。
     var speedAdvice: SpeedAdvice {
-        SpeedAdvisor.advise(
+        // 音乐 CD 的建议跟数据盘不一样：老 CD 机对高倍速刻出来的音轨更挑，宁可慢一点。
+        if mode == .audioCD {
+            return SpeedAdvisor.audioAdvice(
+                reportedSpeeds: status.writeSpeeds,
+                trackCount: items.count
+            )
+        }
+        return SpeedAdvisor.advise(
             media: status.media,
             reportedSpeeds: status.writeSpeeds,
             payloadBytes: totalBytes
@@ -397,9 +579,9 @@ final class AppModel: ObservableObject {
         case .recommended:
             guard let recommended = advice.recommended else { return advice.reason }
             var text = "推荐 \(recommended)x · \(advice.reason)"
-            if totalBytes > 0, status.isPresent {
+            if payloadBytesForEstimate > 0, status.isPresent {
                 let seconds = SpeedAdvisor.estimateDuration(
-                    payloadBytes: totalBytes,
+                    payloadBytes: payloadBytesForEstimate,
                     speed: recommended,
                     media: status.media
                 )
@@ -415,9 +597,9 @@ final class AppModel: ObservableObject {
             return text
         case .fixed(let value):
             var text = "手动指定 \(value)x"
-            if totalBytes > 0, status.isPresent {
+            if payloadBytesForEstimate > 0, status.isPresent {
                 let seconds = SpeedAdvisor.estimateDuration(
-                    payloadBytes: totalBytes,
+                    payloadBytes: payloadBytesForEstimate,
                     speed: value,
                     media: status.media
                 )
@@ -444,6 +626,13 @@ final class AppModel: ObservableObject {
     }
 
     func runCompatibilityScan(reveal: Bool = false) {
+        // 音乐 CD 的盘上没有文件名，这一步对它没有意义：清掉旧结果就行。
+        guard mode == .data else {
+            compatibility = nil
+            compatibilityScanning = false
+            if reveal { showCompatibility = false }
+            return
+        }
         let urls = items.map { $0.url }
         guard !urls.isEmpty else {
             compatibility = nil
@@ -469,6 +658,15 @@ final class AppModel: ObservableObject {
     /// 「开始刻录」第一步：先扫一遍兼容性，再把确认单交给界面。
     func prepareBurn() {
         guard !items.isEmpty else { return }
+        // 音乐 CD 的盘上没有文件名，兼容性预检（Windows 非法字符 / 大小写冲突 / 超长名）
+        // 跟它没关系，直接给确认单。
+        if mode == .audioCD {
+            var report = CompatibilityReport()
+            report.fileCount = items.count
+            report.totalBytes = audioPayloadBytes
+            burnPrep = BurnPrep(report: report, summary: burnSummary(), isAudio: true)
+            return
+        }
         let urls = items.map { $0.url }
         let rules = nameRules
         let summary = burnSummary()
@@ -487,6 +685,9 @@ final class AppModel: ObservableObject {
     }
 
     func burnSummary() -> String {
+        if mode == .audioCD {
+            return audioBurnSummary()
+        }
         let size = ByteText.human(totalBytes)
         let media = status.isPresent ? status.media.displayName : "未知介质"
         var text = "把 \(items.count) 个项目（\(size)）刻录到 \(media)，卷标「\(volumeName)」。"
@@ -501,11 +702,27 @@ final class AppModel: ObservableObject {
         return text
     }
 
+    /// 音乐 CD 的确认单：按时间说话，不按字节。
+    private func audioBurnSummary() -> String {
+        let media = status.isPresent ? status.media.displayName : "未知介质"
+        var text = "把 \(items.count) 条音轨（合计 \(AudioDisc.timeText(audioTotalDuration))）"
+            + "刻成音乐 CD，写到 \(media)。"
+        text += "\n算上每轨 2 秒间隔占 \(AudioDisc.timeText(audioRequiredSeconds))，"
+            + "一张 CD 有 \(AudioDisc.timeText(audioCapacitySeconds))。"
+        text += "\n盘上没有文件系统：电脑看不到「文件」，用 CD 机 / 车载音响 / DVD 播放机放。"
+        if status.isPresent, Multisession.needsGraft(status: status) {
+            text += "\n⚠︎ 这张盘上已经有内容，而音乐 CD 不能追加：刻录前会先擦除这张盘。"
+        }
+        text += "\n刻录速度：\(speedSummaryLine)"
+        if testBurn { text += "\n测试模式不会写入介质，只验证流程。" }
+        return text
+    }
+
     /// 确认单里的速度一行。
     var speedSummaryLine: String {
         guard let speed = effectiveSpeed else { return "自动（由驱动器选择）" }
         let estimated = status.isPresent
-            ? SpeedAdvisor.estimateDuration(payloadBytes: totalBytes, speed: speed, media: status.media)
+            ? SpeedAdvisor.estimateDuration(payloadBytes: payloadBytesForEstimate, speed: speed, media: status.media)
             : 0
         var text = "\(speed)x"
         if case .recommended = speedChoice { text += "（推荐）" }
@@ -768,19 +985,20 @@ final class AppModel: ObservableObject {
     func buildRequest(imageOnlyURL: URL?) -> BurnRequest {
         let name = ImageBuilder.normalizeVolumeName(volumeName)
         let imageOptions = self.imageOptions
-        let burnOptions = BurnOptions(
+       let burnOptions = BurnOptions(
             driveIndex: selectedDriveIndex,
             speed: effectiveSpeed,
-            verify: verify,
+            verify: mode == .audioCD ? false : verify,
             ejectWhenDone: ejectWhenDone,
             testBurn: testBurn,
-            closeDisc: closeDisc,
+            closeDisc: mode == .audioCD ? true : closeDisc,
             eraseFirst: false,
-            appendStrategy: willMergeWholeDisc ? .rewriteMerged : .graft
+            appendStrategy: mode == .data && willMergeWholeDisc ? .rewriteMerged : .graft
         )
         return BurnRequest(
             items: items.map { $0.url },
             volumeName: name,
+            mode: mode,
             imageOptions: imageOptions,
             burnOptions: burnOptions,
             imageOnlyURL: imageOnlyURL,

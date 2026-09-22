@@ -1721,6 +1721,316 @@ run("追加策略：默认是嫁接，合并重刻要显式选") {
     expectEqual(AppendStrategy(rawValue: "graft"), .graft, "存 UserDefaults 用的原始值")
 }
 
+// MARK: - 音乐 CD（红皮书音轨）
+
+/// 造一个最小 PCM WAV 文件（自己写文件头，不依赖任何外部工具）。
+/// 用来跑真实的 `afinfo` / `afconvert`：音乐 CD 这条流水线全靠它们。
+func writeWAV(
+    to url: URL,
+    seconds: Double,
+    sampleRate: Int = 44100,
+    channels: Int = 2,
+    frequency: Double = 440
+) throws {
+    var body = Data()
+    let frames = Int(Double(sampleRate) * seconds)
+    for index in 0..<frames {
+        let value = Int16(12000 * sin(2 * Double.pi * frequency * Double(index) / Double(sampleRate)))
+        for channel in 0..<channels {
+            var sample = (channel == 0 ? value : -value).littleEndian
+            withUnsafeBytes(of: &sample) { body.append(contentsOf: $0) }
+        }
+    }
+    var header = Data()
+    func ascii(_ text: String) { header.append(text.data(using: .ascii)!) }
+    func put32(_ value: UInt32) {
+        var little = value.littleEndian
+        withUnsafeBytes(of: &little) { header.append(contentsOf: $0) }
+    }
+    func put16(_ value: UInt16) {
+        var little = value.littleEndian
+        withUnsafeBytes(of: &little) { header.append(contentsOf: $0) }
+    }
+    ascii("RIFF"); put32(UInt32(36 + body.count)); ascii("WAVE")
+    ascii("fmt "); put32(16); put16(1); put16(UInt16(channels))
+    put32(UInt32(sampleRate)); put32(UInt32(sampleRate * channels * 2))
+    put16(UInt16(channels * 2)); put16(16)
+    ascii("data"); put32(UInt32(body.count))
+    try (header + body).write(to: url)
+}
+
+run("音乐 CD：光盘类型与音频扩展名") {
+    expectEqual(DiscMode.allCases.count, 2, "两种光盘类型")
+    expectEqual(DiscMode.data.localizedName, "数据光盘", "数据光盘的名字")
+    expectEqual(DiscMode.audioCD.localizedName, "音乐 CD", "音乐 CD 的名字")
+    expect(DiscMode.data.usesFileSystemOptions, "数据光盘才有卷标 / 文件系统这些设置")
+    expect(!DiscMode.audioCD.usesFileSystemOptions, "音乐 CD 用不上文件系统设置")
+    expectEqual(DiscMode(rawValue: "audioCD"), .audioCD, "存 UserDefaults 用的原始值")
+
+    for name in ["a.mp3", "b.m4a", "c.wav", "d.aiff", "e.flac", "f.ALAC", "g.MP3"] {
+        expect(AudioDisc.isAudioFile(URL(fileURLWithPath: "/tmp/\(name)")), "\(name) 是音频文件")
+    }
+    for name in ["电影.mp4", "片子.mkv", "说明.txt", "系统.iso", "无扩展名"] {
+        expect(!AudioDisc.isAudioFile(URL(fileURLWithPath: "/tmp/\(name)")), "\(name) 不是音频文件")
+    }
+    // Ogg / Opus 故意不收：macOS 的 CoreAudio 解不了，列出来只会让人以为能刻。
+    expect(!AudioDisc.isAudioFile(URL(fileURLWithPath: "/tmp/x.ogg")), "Ogg 不在支持列表里")
+    expect(!AudioDisc.isAudioFile(URL(fileURLWithPath: "/tmp/x.opus")), "Opus 不在支持列表里")
+}
+
+run("音乐 CD：afinfo 输出解析") {
+    let cdQuality = """
+    File:           /tmp/a.aiff
+    File type ID:   AIFF
+    Num Tracks:     1
+    ----
+    Data format:     2 ch,  44100 Hz, lpcm (0x0000000E) 16-bit big-endian signed integer
+                    no channel layout.
+    estimated duration: 213.184000 sec
+    audio bytes: 37605696
+    """
+    let info = try AudioDisc.parseAFInfo(cdQuality)
+    expect(abs(info.duration - 213.184) < 0.001, "读到时长了")
+    expectEqual(info.channels, 2, "双声道")
+    expectEqual(info.bitsPerSample, 16, "16 bit")
+    expect(info.isCDQuality, "44.1 kHz / 16 bit / 立体声就是 CD 音质")
+    expect(info.formatSummary.contains("44 kHz"), "格式说明写成人话")
+
+    let fortyEight = """
+    Data format:     2 ch,  48000 Hz, Int16, interleaved
+    estimated duration: 95.000000 sec
+    """
+    let high = try AudioDisc.parseAFInfo(fortyEight)
+    expect(!high.isCDQuality, "48 kHz 不是 CD 音质，要重采样")
+    expectEqual(high.bitsPerSample, 16, "Int16 的位深要读出来")
+
+    let compressed = """
+    Data format:     2 ch,  44100 Hz, aac (0x0000000B) 32-bit float
+    estimated duration: 180.000000 sec
+    """
+    let aac = try AudioDisc.parseAFInfo(compressed)
+    expect(!aac.isPCM, "AAC 是压缩格式")
+    expect(!aac.isCDQuality, "压缩格式要转码")
+
+    let mono = """
+    Data format:     1 ch,  44100 Hz, Int16, interleaved
+    estimated duration: 60.000000 sec
+    """
+    expect(!(try AudioDisc.parseAFInfo(mono)).isCDQuality, "单声道要转成立体声")
+
+    expectNil(AudioDisc.parseDuration(fromAFInfo: "File: /tmp/x\nNum Tracks: 1\n"), "没有时长就返回 nil")
+    var threw = false
+    do { _ = try AudioDisc.parseAFInfo("File: /tmp/x\n", name: "x") } catch { threw = true }
+    expect(threw, "解析不出时长要当成读失败")
+}
+
+run("音乐 CD：摊平文件夹、跳过非音频") {
+    let folder = try makeTempDirectory("audio")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let album = folder.appendingPathComponent("专辑", isDirectory: true)
+    try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+    for name in ["a.mp3", "说明.txt", ".DS_Store"] {
+        try Data("x".utf8).write(to: folder.appendingPathComponent(name))
+    }
+    for name in ["3 第三首.mp3", "10 第十首.mp3", "封面.jpg"] {
+        try Data("x".utf8).write(to: album.appendingPathComponent(name))
+    }
+
+    let collected = AudioDisc.collectAudioFiles(from: [folder])
+    expectEqual(collected.audio.count, 3, "文件夹里 3 个音频（.DS_Store 与其它文件不算）")
+    expect(collected.skipped.isEmpty, "文件夹内部的非音频文件不逐条报，只报「这个文件夹没有音频」")
+    expectEqual(
+        Set(collected.audio.map { $0.lastPathComponent }),
+        Set(["a.mp3", "3 第三首.mp3", "10 第十首.mp3"]),
+        "三个音频都找到了"
+    )
+    // 同一个目录里按「自然序」：3 要排在 10 前面，不能按字典序。
+    let names = collected.audio.map { $0.lastPathComponent }
+    let third = names.firstIndex(of: "3 第三首.mp3") ?? -1
+    let tenth = names.firstIndex(of: "10 第十首.mp3") ?? -1
+    expect(third >= 0 && tenth >= 0 && third < tenth, "「3 第三首」排在「10 第十首」前面")
+
+    // 用户一条条拖进来的文件按拖进来的顺序排（文件夹内部才排序）。
+    let explicit = AudioDisc.collectAudioFiles(from: [
+        folder.appendingPathComponent("a.mp3"),
+        album.appendingPathComponent("10 第十首.mp3"),
+        album.appendingPathComponent("3 第三首.mp3"),
+    ])
+    expectEqual(
+        explicit.audio.map { $0.lastPathComponent },
+        ["a.mp3", "10 第十首.mp3", "3 第三首.mp3"],
+        "单独添加的文件保持用户给的顺序"
+    )
+
+    let textOnly = folder.appendingPathComponent("说明.txt")
+    let oneSkip = AudioDisc.collectAudioFiles(from: [textOnly])
+    expectEqual(oneSkip.skipped.count, 1, "直接选一个非音频文件要报出来")
+    expect(oneSkip.skipped[0].reason.contains(".txt"), "跳过原因里写清是什么类型")
+
+    let empty = folder.appendingPathComponent("空", isDirectory: true)
+    try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+    let emptySkip = AudioDisc.collectAudioFiles(from: [empty])
+    expectEqual(emptySkip.skipped.count, 1, "空文件夹也要说一声")
+    expect(emptySkip.skipped[0].reason.contains("没有音频文件"), "说清是文件夹里没有音频")
+}
+
+run("音乐 CD：音轨名、顺序与时长文本") {
+    expectEqual(AudioDisc.trackTitle(from: URL(fileURLWithPath: "/tmp/01 开场曲.mp3")), "开场曲", "去掉「01 」前缀")
+    expectEqual(AudioDisc.trackTitle(from: URL(fileURLWithPath: "/tmp/02 - 第二首.wav")), "第二首", "去掉「02 - 」前缀")
+    expectEqual(AudioDisc.trackTitle(from: URL(fileURLWithPath: "/tmp/3.歌.mp3")), "歌", "去掉「3.」前缀")
+    expectEqual(
+        AudioDisc.trackTitle(from: URL(fileURLWithPath: "/tmp/2001 太空漫游.mp3")),
+        "2001 太空漫游",
+        "四位数开头的名字不算序号，别切坏"
+    )
+    expectEqual(AudioDisc.trackTitle(from: URL(fileURLWithPath: "/tmp/01.mp3")), "01", "光剩序号就保留原名")
+    expectEqual(AudioDisc.safeFileName("a/b:c"), "a-b-c", "文件名里的 / 和 : 要换掉")
+    expectEqual(AudioDisc.safeFileName("   "), "音轨", "空名字要有兜底")
+
+    let tracks = (1...12).map { number in
+        AudioTrack(
+            id: number,
+            sourceURL: URL(fileURLWithPath: "/tmp/\(number).mp3"),
+            title: "曲目 \(number)",
+            duration: 180,
+            sourceBytes: 1,
+            isCDQuality: false
+        )
+    }
+    expectEqual(tracks[0].stagedName, "01 - 曲目 1.aiff", "暂存文件名带两位序号前缀")
+    expectEqual(tracks[9].stagedName, "10 - 曲目 10.aiff", "第 10 轨")
+    // 这条是整条流水线的关键前提：drutil 按文件名字母序写音轨，
+    // 两位数字前缀保证「字母序 == 用户排的顺序」。
+    let sortedNames = tracks.map { $0.stagedName }.sorted()
+    expectEqual(sortedNames, tracks.map { $0.stagedName }, "按名字排序后仍然是用户排的顺序")
+
+    expectEqual(AudioDisc.timeText(0), "0:00", "0 秒")
+    expectEqual(AudioDisc.timeText(185), "3:05", "3 分 5 秒")
+    expectEqual(AudioDisc.timeText(3723), "1:02:03", "超过一小时")
+    expectEqual(AudioDisc.pcmBytes(duration: 1), 176400, "1 秒 CD 音轨 = 176400 字节")
+    expectEqual(AudioDisc.audioSectors(duration: 1), 75, "1 秒 = 75 个红皮书扇区")
+    expectEqual(AudioDisc.audioSectors(duration: 0.5), 38, "不满一扇区也要占一扇区")
+}
+
+run("音乐 CD：容量按时间算，超了要拦下来") {
+    func plan(seconds: [Double]) -> AudioDiscPlan {
+        let tracks = seconds.enumerated().map { index, duration in
+            AudioTrack(
+                id: index + 1,
+                sourceURL: URL(fileURLWithPath: "/tmp/\(index).mp3"),
+                title: "曲目 \(index + 1)",
+                duration: duration,
+                sourceBytes: 1,
+                isCDQuality: true
+            )
+        }
+        return AudioDiscPlan(tracks: tracks)
+    }
+
+    let small = plan(seconds: [100, 100, 100])
+    expectEqual(Int(small.totalDuration), 300, "纯音频 300 秒")
+    expectEqual(Int(small.requiredSeconds), 308, "加上 4 个 2 秒间隔 = 308 秒")
+    expectEqual(Int(small.remainingSeconds), 4800 - 308, "还剩多少")
+    expect(!small.isOverCapacity, "装得下")
+    expectEqual(small.stagedBytes, AudioDisc.pcmBytes(duration: 300), "暂存体积按 PCM 算")
+    expectEqual(small.summary, "3 轨 · 总时长 5:00", "摘要写成「几轨 + 多长」")
+    try AudioDisc.validate(plan: small)
+
+    // 80 分钟整的音频 + 间隔就超了：一张 CD 是 4800 秒。
+    let exact = plan(seconds: Array(repeating: 480, count: 10))
+    expectEqual(Int(exact.totalDuration), 4800, "正好 80 分钟音频")
+    expect(exact.isOverCapacity, "再加上每轨 2 秒间隔就装不下了")
+    var threw = false
+    do { try AudioDisc.validate(plan: exact) } catch { threw = true }
+    expect(threw, "超容量要中止（除非 --force）")
+    try AudioDisc.validate(plan: exact, force: true)
+
+    var emptyThrew = false
+    do { try AudioDisc.validate(plan: plan(seconds: [])) } catch { emptyThrew = true }
+    expect(emptyThrew, "一条音轨都没有也要拒绝")
+
+    // 音频扇区 2352 字节、数据扇区 2048 字节：80 分钟音轨（807 MiB）比 80 分钟 CD-R 的
+    // 「数据容量」（703 MiB）还大，所以音乐 CD 绝不能拿字节数去比光盘剩余空间，只能比时间。
+    expectEqual(AudioDisc.audioSectors(duration: 4800), 360_000, "80 分钟正好是 36 万个红皮书扇区")
+    expect(
+        AudioDisc.pcmBytes(duration: 4800) > Int64(360_000 * 2048),
+        "80 分钟音轨比 CD-R 的数据容量还大——音乐 CD 只能按时间算容量"
+    )
+}
+
+run("音乐 CD：倍速建议与写盘参数") {
+    let advised = SpeedAdvisor.audioAdvice(reportedSpeeds: [8, 16, 24])
+    expectEqual(advised.recommended, 8, "上报到 24x 也只推荐 8x")
+    expectEqual(advised.conservativeCap, 16, "稳妥上限 16x")
+    expect(advised.reason.contains("CD 机"), "理由要讲清是给 CD 机听的")
+    expectEqual(SpeedAdvisor.audioAdvice(reportedSpeeds: [24, 48]).recommended, 24, "驱动器只有高速档就用最低那档")
+    expectEqual(SpeedAdvisor.audioAdvice(reportedSpeeds: []).recommended, 8, "问不到能力就用常用值")
+    expect(SpeedAdvisor.audioAdvice(reportedSpeeds: [8]).caution(for: 16) != nil, "手选 16x 要提醒")
+
+    let folder = URL(fileURLWithPath: "/tmp/音轨")
+    let arguments = Burner.burnAudioArguments(directory: folder, options: BurnOptions(speed: 8))
+    expect(arguments.contains("-audio"), "要带 -audio")
+    expect(arguments.contains("-noappendable"), "音频盘一次写完并收尾，不能追加")
+    expect(arguments.contains("-noverify"), "音轨没有文件系统可校验")
+    expect(!arguments.contains("-appendable"), "不能留成可追加")
+    expect(!arguments.contains("-verify"), "不校验")
+    expectEqual(arguments.last, folder.path, "目录放在最后")
+    expect(arguments.contains("-speed") && arguments.contains("8"), "带上倍速")
+    expectEqual(Burner.burnAudioArguments(directory: folder, options: BurnOptions(driveIndex: 1)).prefix(2), ["-drive", "1"], "驱动器编号要在最前面")
+    expect(Burner.burnAudioArguments(directory: folder, options: BurnOptions(testBurn: true)).contains("-test"), "测试模式")
+    expect(Burner.burnAudioArguments(directory: folder, options: BurnOptions(ejectWhenDone: true)).contains("-eject"), "刻完弹出")
+    expect(!Burner.burnAudioArguments(directory: folder, options: BurnOptions(ejectWhenDone: false)).contains("-eject"), "可以选不弹出")
+}
+
+run("音乐 CD：介质与错误提示") {
+    expect(AudioDiscError.requiresCDMedia("DVD+R").localizedDescription.contains("CD-R"), "说清只能用 CD-R/RW")
+    expect(AudioDiscError.requiresCDMedia("DVD+R").localizedDescription.contains("DVD"), "顺便解释 DVD 为什么不行")
+    expect(AudioDiscError.needsBlankDisc(sessions: 3, media: "CD-RW").localizedDescription.contains("不能追加"), "说清不能追加")
+    expect(AudioDiscError.needsBlankDisc(sessions: 3, media: "CD-RW").localizedDescription.contains("CD-RW"), "给出可重写介质这条出路")
+    expect(AudioDiscError.noAudioTracks.localizedDescription.contains("MP3"), "空列表时告诉用户支持哪些格式")
+    expect(AudioDiscError.overCapacity(required: 5000, available: 4800).localizedDescription.contains("超过"), "超容量的说法")
+}
+
+run("音乐 CD：真跑 afinfo 与 afconvert（转出红皮书音轨）") {
+    let folder = try makeTempDirectory("audio-real")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let first = folder.appendingPathComponent("01 三秒.wav")
+    let second = folder.appendingPathComponent("02 - 两秒 48k 单声道.wav")
+    try writeWAV(to: first, seconds: 3, sampleRate: 44100, channels: 2)
+    try writeWAV(to: second, seconds: 2, sampleRate: 48000, channels: 1)
+
+    let firstInfo = try AudioDisc.info(for: first)
+    expect(abs(firstInfo.duration - 3) < 0.05, "afinfo 读出的时长")
+    expect(firstInfo.isCDQuality, "44.1 kHz / 16 bit / 立体声就是 CD 音质")
+    let secondInfo = try AudioDisc.info(for: second)
+    expect(!secondInfo.isCDQuality, "48 kHz 单声道要先转码")
+    expectEqual(secondInfo.channels, 1, "单声道")
+
+    let plan = try AudioDisc.plan(items: [first, second])
+    expectEqual(plan.tracks.count, 2, "两条音轨")
+    expectEqual(plan.tracks[0].id, 1, "音轨号从 1 开始")
+    expectEqual(plan.tracks[1].id, 2, "第二条是 2")
+    expectEqual(plan.tracks[1].title, "两秒 48k 单声道", "显示名去掉扩展名与序号")
+    expectEqual(plan.cdQualityCount, 1, "只有一条本来就是 CD 音质")
+
+    let staging = folder.appendingPathComponent("staging", isDirectory: true)
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+    let staged = try AudioDiscStager.stage(tracks: plan.tracks, into: staging)
+    expectEqual(staged.count, 2, "两条都转好了")
+    let names = try FileManager.default.contentsOfDirectory(atPath: staging.path).sorted()
+    expectEqual(names, ["01 - 三秒.aiff", "02 - 两秒 48k 单声道.aiff"], "暂存文件名 = 序号 + 标题")
+
+    // 转出来的文件必须真的是红皮书格式，不然 CD 机放不了。
+    for name in names {
+        let url = staging.appendingPathComponent(name)
+        let info = try AudioDisc.info(for: url)
+        expect(info.isCDQuality, "\(name) 应该是 44.1 kHz / 16 bit / 立体声")
+        expect(Workspace.fileSize(of: url) > 0, "\(name) 不能是空文件")
+    }
+    let stagedFirst = try AudioDisc.info(for: staging.appendingPathComponent(names[0]))
+    expect(abs(stagedFirst.duration - 3) < 0.05, "转码后时长不变")
+}
+
 print("")
 if failureCount == 0 {
     print("全部 \(checkCount) 项检查通过 ✅")

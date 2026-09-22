@@ -79,6 +79,28 @@
   `IsoImageReader.read` 一律把长度向上取整到扇区边界再截断，别改回「要多少读多少」——
   否则导出小文件、以及合并重刻时读旧文件都会失败。
 
+## 音乐 CD（红皮书音轨）
+
+- **盘上没有文件系统**：音乐 CD 写的是音轨，不写 ISO/UDF。访达 / 资源管理器里看不到「文件」是规范本身的样子，
+  界面确认单、CLI 完成语都写了这句话——别当成 bug 去「修」，也别把它当成「刻坏了」。
+- **写盘只能用 `drutil burn -audio <目录>`**：它把目录里**能解码的音频文件**各写成一条音轨，
+  顺序是**文件名字母序**。用户排的音轨顺序靠「暂存文件名 = `NN - 标题.aiff`（两位序号前缀）」对齐，
+  别去掉这个前缀，否则「10 某首歌」会跑到「2 某首歌」前面（`AudioTrack.stagedName` 是唯一来源，自检里有回归用例）。
+- **转码用系统自带的 `afconvert`**（`-f AIFF -d BEI16@44100 -c 2`），读时长用 `afinfo`，**不要引 ffmpeg**：
+  这两个工具够覆盖 MP3 / M4A / AAC / WAV / AIFF / ALAC / FLAC，多一个几十兆的依赖不值当。
+  Ogg / Opus 故意不放进 `AudioDisc.audioExtensions`——CoreAudio 解不了，列出来只会让人以为能刻。
+- **`afinfo` 的位深有两种写法**：WAV 报 `Int16`（数字在后），AIFF / lpcm 报 `16-bit ...`（数字在前），
+  解析必须两种都认（`AudioDisc.sampleBitDepth`）；另外 `interleaved` 里也含 `int`，别被它带偏。
+  「已是 CD 音质」的判据是 PCM + 2 声道 + 44100 Hz + 16 bit。
+- **只能刻 CD-R / CD-RW**：DVD / 蓝光的坑距和反射率跟 CD 不一样，刻出来的音轨 CD 机读不到，
+  `AudioDiscError.requiresCDMedia` 直接拦住并说明原因。
+- **不能追加**：音频盘不能多区段（多数 CD 机只认第一段）。盘上已有内容时，只有可重写介质走「先擦再刻」，
+  一次性介质直接报错让用户换盘；判断「盘上有没有内容」一律用 `Multisession.needsGraft`，别看段数。
+- **容量按时间算**：一张 CD 是 4800 秒（80 分钟），还要加每轨 2 秒的间隔（`AudioDiscPlan.requiredSeconds`），
+  这也是为什么 30 首 4 分钟的歌正好放不下。临时空间要留够：一小时音频 ≈ 600 MB AIFF。
+- **倍速默认 8x**（`SpeedAdvisor.audioAdvice`）：音频盘跟数据盘不是一回事，老 CD 机、车载音响的误码纠正能力弱，
+  对高倍速刻出来的音轨更挑。
+
 ## 看界面的正确姿势
 
 - **优先看真窗口**：`open dist/DiscBurner.app`，然后

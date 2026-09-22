@@ -130,23 +130,36 @@ struct ContentView: View {
                     dropPlaceholder
                 } else {
                     List {
-                        ForEach(model.items) { item in
+                        ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
                             HStack(spacing: 8) {
-                                Image(systemName: item.isDirectory ? "folder.fill" : iconName(for: item.url))
-                                    .foregroundColor(item.isDirectory ? Color.accentColor : .secondary)
-                                    .frame(width: 18)
+                                if model.mode == .audioCD {
+                                    // 音乐 CD 的顺序就是音轨号：列表里排第几，盘上就是第几轨。
+                                    Text("\(index + 1)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                        .frame(width: 22, alignment: .trailing)
+                                    Image(systemName: "music.note")
+                                        .foregroundColor(.accentColor)
+                                        .frame(width: 18)
+                                } else {
+                                    Image(systemName: item.isDirectory ? "folder.fill" : iconName(for: item.url))
+                                        .foregroundColor(item.isDirectory ? Color.accentColor : .secondary)
+                                        .frame(width: 18)
+                                }
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text(item.name).lineLimit(1)
-                                    Text(item.url.deletingLastPathComponent().path)
+                                    Text(model.mode == .audioCD ? trackTitle(for: item) : item.name)
+                                        .lineLimit(1)
+                                    Text(model.mode == .audioCD ? item.name : item.url.deletingLastPathComponent().path)
                                         .font(.system(size: 10))
                                         .foregroundColor(.secondary)
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                 }
                                 Spacer()
-                                Text(item.sizeText)
-                                    .font(.system(size: 11))
+                                Text(model.mode == .audioCD ? item.durationText : item.sizeText)
+                                    .font(.system(size: 11, design: model.mode == .audioCD ? .monospaced : .default))
                                     .foregroundColor(.secondary)
+                                    .frame(minWidth: 46, alignment: .trailing)
                                 Button {
                                     model.remove(item)
                                 } label: {
@@ -168,15 +181,39 @@ struct ContentView: View {
             }
 
             Divider()
-            HStack {
-                Text("合计 \(ByteText.human(model.totalBytes))")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(model.isOverCapacity ? .red : .primary)
-                compatibilityBadge
-                Spacer()
-                Text(dropHint)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    if model.mode == .audioCD {
+                        Text("合计 \(AudioDisc.timeText(model.audioTotalDuration))")
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundColor(model.isOverCapacity ? .red : .primary)
+                        Text("· 占 \(AudioDisc.timeText(model.audioRequiredSeconds)) / \(AudioDisc.timeText(model.audioCapacitySeconds))")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(model.isOverCapacity ? .red : .secondary)
+                        if model.audioDurationsPending {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle())
+                                .scaleEffect(0.45)
+                                .frame(width: 12, height: 12)
+                        }
+                    } else {
+                        Text("合计 \(ByteText.human(model.totalBytes))")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(model.isOverCapacity ? .red : .primary)
+                        compatibilityBadge
+                    }
+                    Spacer()
+                    Text(dropHint)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+                if model.mode == .audioCD, let notice = model.audioSkipNotice {
+                    Text(notice)
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -232,6 +269,11 @@ struct ContentView: View {
     }
 
     private var dropHint: String {
+        if model.mode == .audioCD {
+            let remaining = model.audioRemainingSeconds
+            if remaining < 0 { return "超出 \(AudioDisc.timeText(-remaining))" }
+            return "还能放 \(AudioDisc.timeText(remaining))"
+        }
         if let capacity = model.capacityBytes {
             return "光盘可用 \(ByteText.human(capacity))"
         }
@@ -240,19 +282,21 @@ struct ContentView: View {
 
     private var dropPlaceholder: some View {
         VStack(spacing: 12) {
-            Image(systemName: "square.and.arrow.down.on.square")
+            Image(systemName: model.mode == .audioCD ? "music.note.list" : "square.and.arrow.down.on.square")
                 .font(.system(size: 44, weight: .light))
                 .foregroundColor(.secondary)
             VStack(spacing: 4) {
-                Text("把文件或文件夹拖到这里")
+                Text(model.mode == .audioCD ? "把音频文件或文件夹拖到这里" : "把文件或文件夹拖到这里")
                     .font(.headline)
                     .foregroundColor(.secondary)
-                Text("支持任意文件类型，目录结构会被保留")
+                Text(model.mode == .audioCD
+                     ? "MP3 / M4A / AAC / WAV / AIFF / ALAC / FLAC；一张 CD 约 80 分钟"
+                     : "支持任意文件类型，目录结构会被保留")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
             HStack(spacing: 8) {
-                Button("选择文件…", action: addFiles)
+                Button(model.mode == .audioCD ? "选择音频文件…" : "选择文件…", action: addFiles)
                 Button("选择文件夹…", action: addFolder)
             }
             .disabled(model.isBusy)
@@ -282,52 +326,86 @@ struct ContentView: View {
         }
     }
 
+    /// 音轨在列表里显示的名字：去掉扩展名与常见的「01 -」序号前缀。
+    private func trackTitle(for item: FileItem) -> String {
+        AudioDisc.trackTitle(from: item.url)
+    }
+
     // MARK: - 右侧设置
 
     private var settingsColumn: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                section("光盘设置") {
-                    HStack {
-                        Text("卷标")
-                        Spacer()
-                        TextField("卷标", text: $model.volumeName)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                            .frame(width: 190)
-                    }
-                    .disabled(model.isBusy)
-                    Text("显示在「访达」里的光盘名称，建议不超过 16 个字符。")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-
-                    Picker("文件系统", selection: $model.preset) {
-                        ForEach(FileSystemPreset.allCases) { preset in
-                            Text(preset.title).tag(preset)
+                // 数据光盘 / 音乐 CD 是两条完全不同的流水线，所以类型切换放在最上面，
+                // 下面的「光盘设置 / 兼容性预检」只对数据光盘有意义。
+                section("光盘类型") {
+                    Picker("", selection: $model.mode) {
+                        ForEach(DiscMode.allCases) { mode in
+                            Text(mode.localizedName).tag(mode)
                         }
                     }
+                    .pickerStyle(SegmentedPickerStyle())
+                    .labelsHidden()
                     .disabled(model.isBusy)
-                    Text(model.preset.detail)
+                    Text(model.mode.detail)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
-                    Text("实际写入：\(model.filesystemSummary)")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-
-                    Toggle("剔除 .DS_Store 等 macOS 垃圾文件", isOn: $model.excludeJunk)
-                        .disabled(model.isBusy)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
-                section("兼容性预检") {
-                    CompatibilityPanel()
+                if model.mode == .data {
+                    section("光盘设置") {
+                        HStack {
+                            Text("卷标")
+                            Spacer()
+                            TextField("卷标", text: $model.volumeName)
+                                .textFieldStyle(RoundedBorderTextFieldStyle())
+                                .frame(width: 190)
+                        }
+                        .disabled(model.isBusy)
+                        Text("显示在「访达」里的光盘名称，建议不超过 16 个字符。")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+
+                        Picker("文件系统", selection: $model.preset) {
+                            ForEach(FileSystemPreset.allCases) { preset in
+                                Text(preset.title).tag(preset)
+                            }
+                        }
+                        .disabled(model.isBusy)
+                        Text(model.preset.detail)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                        Text("实际写入：\(model.filesystemSummary)")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+
+                        Toggle("剔除 .DS_Store 等 macOS 垃圾文件", isOn: $model.excludeJunk)
+                            .disabled(model.isBusy)
+                    }
+
+                    section("兼容性预检") {
+                        CompatibilityPanel()
+                    }
                 }
 
                 section("刻录选项") {
-                    Toggle("刻录后校验数据", isOn: $model.verify)
-                        .disabled(model.isBusy)
+                    if model.mode == .data {
+                        Toggle("刻录后校验数据", isOn: $model.verify)
+                            .disabled(model.isBusy)
+                    }
                     Toggle("完成后弹出光盘", isOn: $model.ejectWhenDone)
                         .disabled(model.isBusy)
-                    Toggle("关闭光盘（之后无法追加数据）", isOn: $model.closeDisc)
-                        .disabled(model.isBusy)
+                    if model.mode == .data {
+                        Toggle("关闭光盘（之后无法追加数据）", isOn: $model.closeDisc)
+                            .disabled(model.isBusy)
+                    } else {
+                        Text("音乐 CD 会一次写完并收尾：音频盘不能追加（大多数 CD 机只认第一段），"
+                            + "也没有文件系统可校验。")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     Toggle("测试模式（不打开激光、不写入介质）", isOn: $model.testBurn)
                         .disabled(model.isBusy)
 
@@ -421,7 +499,13 @@ struct ContentView: View {
                         Label("仅生成 ISO 映像", systemImage: "square.and.arrow.down")
                             .frame(maxWidth: .infinity)
                     }
-                    .disabled(model.items.isEmpty || model.isBusy)
+                    .disabled(model.items.isEmpty || model.isBusy || model.mode == .audioCD)
+                    if model.mode == .audioCD {
+                        Text("音乐 CD 没有映像文件可生成：它写的是音轨，不是文件系统。")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     Text("「开始刻录」固定在窗口右下角，滚动这一栏也不会被挡住。")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
@@ -469,8 +553,13 @@ struct ContentView: View {
     }
 
     private var canBurn: Bool {
-        guard !model.items.isEmpty else { return false }
+        guard !model.items.isEmpty, !model.isOverCapacity else { return false }
         if model.testBurn { return model.status.isPresent }
+        if model.mode == .audioCD {
+            // 音乐 CD 不能追加，但可重写盘上已经有内容时可以先擦再刻。
+            return model.status.media.isCD
+                && (model.status.canBurn || model.status.erasable || model.status.media.isRewritable)
+        }
         return model.status.canBurn
     }
 
@@ -489,7 +578,17 @@ struct ContentView: View {
                         .font(.system(size: 11))
                         .foregroundColor(model.status.canBurn ? .green : .orange)
                 }
-                if let capacity = model.status.writableBytes {
+                if model.mode == .audioCD {
+                    ProgressView(value: model.audioUsageFraction)
+                        .accentColor(model.isOverCapacity ? .red : .accentColor)
+                    HStack {
+                        Text("已选 \(AudioDisc.timeText(model.audioRequiredSeconds))")
+                        Spacer()
+                        Text("一张 CD 约 \(AudioDisc.timeText(model.audioCapacitySeconds))")
+                    }
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                } else if let capacity = model.status.writableBytes {
                     ProgressView(value: model.usageFraction)
                         .accentColor(model.isOverCapacity ? .red : .accentColor)
                     HStack {
@@ -515,7 +614,9 @@ struct ContentView: View {
             } else {
                 Text("未插入光盘")
                     .font(.system(size: 13, weight: .semibold))
-                Text("请放入空白 CD-R/RW、DVD±R/RW 或 BD-R/RE。")
+                Text(model.mode == .audioCD
+                     ? "音乐 CD 需要空白 CD-R / CD-RW。"
+                     : "请放入空白 CD-R/RW、DVD±R/RW 或 BD-R/RE。")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
             }

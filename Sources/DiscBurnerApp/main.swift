@@ -133,6 +133,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             model.demoRewritable = true
         }
 
+        // 截屏用：`--demo-audio` 直接以「音乐 CD」模式启动（配合 `--demo-items` 看音轨列表）。
+        // 只改这一次运行的模式，不写进 UserDefaults。
+        if launchArguments.contains("--demo-audio") {
+            model.persistModeChanges = false
+            model.mode = .audioCD
+        }
+
         // 排错/截屏用：`--demo-items <路径…>` 只把内容加进列表，
         // `--demo-compatibility <路径…>` 再加完内容后打开预检窗口，
         // `--demo-burnprep` 直接摆出「开始刻录？」确认单（光驱里没有可写盘时也能看）。

@@ -133,11 +133,17 @@ cat > "$CONTENTS/Resources/命令行工具说明.txt" <<EOF
     discburn burn ~/Movies ~/合同.pdf --name 归档
     discburn burn ~/Documents --fix-names
     discburn burn ~/backup.iso
+    discburn audio ~/Music/旅行歌单 --speed 8
     discburn erase --mode quick
     discburn --version
 
 刻录前会先做兼容性预检（Windows 非法字符、保留名、大小写冲突、超长名…），
 加 --fix-names 可以自动把不兼容的名字改掉（只改光盘里的副本）。
+
+音乐 CD：`discburn audio <音频文件或文件夹>`
+  把 MP3 / M4A / AAC / WAV / AIFF / ALAC / FLAC 转成红皮书音轨刻进 CD-R / CD-RW，
+  CD 机、车载音响能直接放。盘上没有文件系统（电脑看不到「文件」），不能追加。
+  只想先看装不装得下：`discburn plan <路径…> --audio`
 
 运行 discburn --help 查看全部选项。
 

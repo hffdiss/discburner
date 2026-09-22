@@ -44,6 +44,8 @@ public struct BurnRequest {
     /// 要刻录的文件/文件夹（可来自任意位置）。
     public var items: [URL]
     public var volumeName: String
+    /// 这次刻的是数据光盘还是音乐 CD（音乐 CD 走红皮书音轨，没有文件系统）。
+    public var mode: DiscMode
     public var imageOptions: ImageOptions
     public var burnOptions: BurnOptions
     /// 只生成映像文件而不刻录时设置（此时不写盘）。
@@ -57,6 +59,7 @@ public struct BurnRequest {
     public init(
         items: [URL],
         volumeName: String,
+        mode: DiscMode = .data,
         imageOptions: ImageOptions? = nil,
         burnOptions: BurnOptions = BurnOptions(),
         imageOnlyURL: URL? = nil,
@@ -66,6 +69,7 @@ public struct BurnRequest {
     ) {
         self.items = items
         self.volumeName = volumeName
+        self.mode = mode
         self.imageOptions = imageOptions ?? ImageOptions(volumeName: volumeName)
         self.burnOptions = burnOptions
         self.imageOnlyURL = imageOnlyURL
@@ -82,6 +86,9 @@ public struct BurnOutcome {
     public var mediaAfter: DiscStatus?
     public var duration: TimeInterval
     public var wasTestBurn: Bool
+    /// 音乐 CD：这次写进去的音轨条数与总时长。
+    public var audioTrackCount: Int = 0
+    public var audioDuration: TimeInterval = 0
 }
 
 /// 端到端任务：整理文件 → 生成映像 → 检查容量 →（可选）擦除 → 写入 → 校验 → 弹出。
@@ -121,6 +128,11 @@ public final class BurnJob {
 
     private func runInternal(onUpdate: @escaping (JobUpdate) -> Void) throws -> BurnOutcome {
         guard !request.items.isEmpty else { throw BurnError.noItems }
+
+        // 音乐 CD 是另一条流水线：没有映像、没有文件系统，也不能追加。
+        if request.mode == .audioCD {
+            return try runAudioDisc(onUpdate: onUpdate)
+        }
 
         // 1. 检查驱动器与介质
         report(onUpdate, .checking, 0.0, "正在检测光驱…")
@@ -480,6 +492,219 @@ public final class BurnJob {
             keepImage: !temporaryImage,
             fileCount: Workspace.fileCount(of: workspace.staging),
             filesystem: engine.localizedSummary
+        )
+    }
+
+    // MARK: - 音乐 CD
+
+    /// 音乐 CD 的完整流程：读音频信息 → 算时长 → 检查介质 → 转成 CD 音轨 → 写盘。
+    ///
+    /// 跟数据光盘的差别在于：不生成映像、盘上没有文件系统、也不能追加。
+    /// `drutil burn -audio` 会把暂存目录里的音频文件逐条转成红皮书音轨写进去，
+    /// 顺序是文件名字母序（暂存文件名带两位序号前缀，见 `AudioTrack.stagedName`）。
+    private func runAudioDisc(onUpdate: @escaping (JobUpdate) -> Void) throws -> BurnOutcome {
+        report(onUpdate, .checking, 0.02, "正在检测光驱…")
+        let drives = try DriveService.listDrives()
+        guard let drive = selectDrive(from: drives) else { throw BurnError.noDrive }
+        let mediaBefore = try DriveService.status(driveIndex: drive.index)
+        var status = mediaBefore
+        guard status.isPresent else { throw BurnError.noMedia }
+        // 音乐 CD 只能刻在 CD 介质上：DVD/蓝光的坑距和反射率跟 CD 不一样，
+        // 刻出来的音轨 CD 机读不到。
+        guard status.media.isCD else { throw AudioDiscError.requiresCDMedia(status.media.displayName) }
+
+        let canErase = status.erasable || status.media.isRewritable
+        // 「盘上有内容」不能用段数判断：空白盘的 discinfo 也会写 Sessions: 1。
+        let hasContent = Multisession.needsGraft(status: status)
+        var eraseBefore = request.burnOptions.eraseFirst
+        if !request.burnOptions.testBurn {
+            guard status.media.isWritable else { throw BurnError.mediaNotWritable(status.media.displayName) }
+            if hasContent {
+                guard canErase else {
+                    throw AudioDiscError.needsBlankDisc(
+                        sessions: status.sessions ?? 1,
+                        media: status.media.displayName
+                    )
+                }
+                // 音频盘不能追加，盘上有东西就只能先擦掉。
+                eraseBefore = true
+            } else if !status.writability.canBurn {
+                guard canErase else { throw BurnError.mediaClosed(status.media.displayName) }
+                eraseBefore = true
+            }
+            if request.burnOptions.eraseFirst, !canErase {
+                throw BurnError.notRewritable(status.media.displayName)
+            }
+        }
+        report(onUpdate, .checking, 0.04, "光驱：\(drive.displayName) · 介质：\(status.summary)")
+
+        // 1. 读音频信息、排音轨
+        report(onUpdate, .staging, 0.06, "正在读取音频信息…")
+        let plan = try AudioDisc.plan(items: request.items) { done, total, url in
+            guard total > 0 else { return }
+            self.report(
+                onUpdate,
+                .staging,
+                0.06 + 0.10 * Double(done) / Double(total),
+                "已读取 \(done)/\(total)：\(url.lastPathComponent)"
+            )
+        }
+        try checkCancelled()
+        guard !plan.tracks.isEmpty else { throw AudioDiscError.noAudioTracks }
+        if !plan.skipped.isEmpty {
+            var log = ""
+            for skip in plan.skipped.prefix(50) {
+                log += "· 跳过 \(skip.displayName)：\(skip.reason)\n"
+            }
+            if plan.skipped.count > 50 {
+                log += "…（还有 \(plan.skipped.count - 50) 个被跳过）\n"
+            }
+            report(
+                onUpdate,
+                .staging,
+                0.16,
+                "音乐 CD 只收音频文件，已跳过 \(plan.skipped.count) 个",
+                log: log.trimmingCharacters(in: .newlines)
+            )
+        }
+        let qualityNote = plan.cdQualityCount == plan.tracks.count
+            ? "全部音轨都已是 CD 音质（44.1 kHz / 16 bit / 立体声），不用重采样"
+            : "\(plan.tracks.count - plan.cdQualityCount) 条会转成 44.1 kHz / 16 bit / 立体声"
+        report(
+            onUpdate,
+            .staging,
+            0.17,
+            "\(plan.summary) · 加上每轨 2 秒间隔占 \(AudioDisc.timeText(plan.requiredSeconds))，一张 CD 有 \(AudioDisc.timeText(plan.capacitySeconds))；\(qualityNote)"
+        )
+        try AudioDisc.validate(plan: plan, force: request.force)
+
+        // 2. 转码要有地方放：一小时 CD 音轨大约 600 MB
+        let required = plan.stagedBytes
+        if let available = Workspace.availableSpace(at: URL(fileURLWithPath: NSTemporaryDirectory())),
+           available < required + 64 * 1024 * 1024 {
+            throw AudioDiscError.notEnoughSpace(required: required, available: available)
+        }
+
+        // 3. 需要时先擦盘
+        if eraseBefore {
+            report(
+                onUpdate,
+                .erasing,
+                0.2,
+                hasContent ? "盘上已有内容，音乐 CD 不能追加：正在擦除光盘…" : "正在擦除光盘…"
+            )
+            try Burner.erase(mode: .quick, driveIndex: drive.index, canceller: canceller) { progress in
+                self.report(
+                    onUpdate,
+                    .erasing,
+                    self.scale(progress.fraction, 0.2, 0.28),
+                    progress.message.isEmpty ? "正在擦除光盘…" : progress.message,
+                    log: progress.rawLine
+                )
+            }
+            status = try DriveService.status(driveIndex: drive.index)
+            report(onUpdate, .erasing, 0.28, "擦除完成 · \(status.summary)")
+        }
+
+        // 4. 转成 CD 音轨
+        let workspace = try Workspace()
+        self.workspace = workspace
+        if request.keepWorkspace {
+            report(onUpdate, .staging, 0.3, "临时目录：\(workspace.root.path)")
+        }
+        report(onUpdate, .staging, 0.3, "正在把 \(plan.tracks.count) 条音轨转成 CD 音频…")
+        try AudioDiscStager.stage(
+            tracks: plan.tracks,
+            into: workspace.staging,
+            canceller: canceller
+        ) { done, total, title in
+            guard total > 0 else { return }
+            self.report(
+                onUpdate,
+                .staging,
+                0.3 + 0.28 * Double(done) / Double(total),
+                "已转换 \(done)/\(total)：\(title)",
+                log: done > 0 ? nil : "· 转码目标：44.1 kHz / 16 bit / 立体声 AIFF"
+            )
+        }
+        try checkCancelled()
+        let payloadBytes = Workspace.size(of: workspace.staging)
+        report(onUpdate, .staging, 0.58, "音轨已就绪：\(plan.tracks.count) 轨 · \(ByteText.human(payloadBytes))")
+        // 这里**不能**拿字节数去比 `status.writableBytes`：音频扇区是 2352 字节，数据扇区是 2048，
+        // 一张 80 分钟的 CD-R「数据容量」只有 703 MiB，而 80 分钟音轨是 807 MiB——比字节会把
+        // 正好刻满的音乐 CD 误判成超容量。音乐 CD 的容量一律按时间算（上面 `AudioDisc.validate`）。
+
+        // 5. 写盘
+        let action = request.burnOptions.testBurn ? "测试刻录（不会写入介质）" : "刻录"
+        report(onUpdate, .preparing, 0.6, "\(action)：音乐 CD（\(plan.tracks.count) 轨）")
+        var parser = BurnOutputParser(phase: .preparing)
+        let ticker = BurnProgressTicker()
+        let estimated = SpeedAdvisor.estimateDuration(
+            payloadBytes: payloadBytes,
+            speed: request.burnOptions.speed ?? 0,
+            media: status.media
+        )
+        if estimated > 0, !request.burnOptions.testBurn {
+            ticker.start(estimatedSeconds: estimated) { elapsed in
+                let fraction = min(0.9, 0.62 + 0.3 * (elapsed / estimated))
+                self.report(
+                    onUpdate,
+                    .burning,
+                    fraction,
+                    "正在刻录音轨… " + SpeedAdvisor.progressText(elapsed: elapsed, remaining: estimated - elapsed)
+                )
+            }
+        }
+        defer { ticker.stop() }
+        _ = try Burner.burnAudio(
+            directory: workspace.staging,
+            options: request.burnOptions,
+            canceller: canceller
+        ) { line in
+            var update = parser.consume(line.rawLine ?? line.message)
+            update.message = update.message.isEmpty ? "正在刻录音轨…" : "正在刻录音轨… \(update.message)"
+            self.report(
+                onUpdate,
+                .burning,
+                self.scale(update.fraction, 0.6, 0.99),
+                update.message,
+                log: update.rawLine
+            )
+        }
+        ticker.stop()
+        try checkCancelled()
+
+        let mediaAfter = try? DriveService.status(driveIndex: drive.index)
+        // 记一笔账（数据光盘那条路也记）：`discburn history` 和界面里的「本机刻录记录」都读它。
+        if !request.burnOptions.testBurn {
+            BurnHistory.record(
+                BurnRecord(
+                    volumeName: "音乐 CD",
+                    mediaKind: status.media.displayName,
+                    mediaID: status.mediaID,
+                    sessionIndex: 1,
+                    payloadBytes: payloadBytes,
+                    fileCount: plan.tracks.count,
+                    topLevelItems: plan.tracks.map { $0.title },
+                    wasTestBurn: false,
+                    filesystem: "红皮书音轨（\(plan.tracks.count) 轨 · \(AudioDisc.timeText(plan.totalDuration))）"
+                )
+            )
+        }
+        let finishedText = request.burnOptions.testBurn
+            ? "测试刻录完成：音乐 CD \(plan.tracks.count) 轨"
+            : "刻录完成：音乐 CD \(plan.tracks.count) 轨 · 总时长 \(AudioDisc.timeText(plan.totalDuration))"
+        report(onUpdate, .finished, 1.0, finishedText)
+        cleanup()
+        return BurnOutcome(
+            imageURL: nil,
+            payloadBytes: payloadBytes,
+            mediaBefore: mediaBefore,
+            mediaAfter: mediaAfter,
+            duration: Date().timeIntervalSince(startedAt),
+            wasTestBurn: request.burnOptions.testBurn,
+            audioTrackCount: plan.tracks.count,
+            audioDuration: plan.totalDuration
         )
     }
 

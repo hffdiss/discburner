@@ -165,6 +165,37 @@ public enum SpeedAdvisor {
         )
     }
 
+    /// 音乐 CD（红皮书音轨）的倍速建议。
+    ///
+    /// 音频盘跟数据盘不是一回事：老 CD 机、车载音响的误码纠正能力弱，对高倍速刻出来的
+    /// 音轨更挑，所以宁可慢一点。8x 是常见的安全档，超过 16x 对音频盘没有意义
+    /// （80 分钟的盘用 8x 也就刻 10 分钟出头）。
+    public static func audioAdvice(reportedSpeeds: [Int], trackCount: Int = 1) -> SpeedAdvice {
+        let available = Array(Set(reportedSpeeds.filter { $0 > 0 })).sorted()
+        let sweet = 8
+        let cap = 16
+        var recommended: Int?
+        var reason: String
+
+        if let best = available.last(where: { $0 <= sweet }) {
+            recommended = best
+            reason = "音乐 CD 用 \(best)x：CD 机 / 车载音响对高倍速刻出来的音轨更挑，慢一点更保险"
+        } else if let lowest = available.first {
+            recommended = lowest
+            reason = "驱动器只支持 \(available.map { "\($0)x" }.joined(separator: "/") )，最低一档 \(lowest)x 也高于音频盘常用的 \(sweet)x"
+        } else {
+            recommended = sweet
+            reason = "驱动器没有上报倍速，音频盘按常用的 \(sweet)x"
+        }
+
+        return SpeedAdvice(
+            recommended: recommended,
+            reason: reason,
+            conservativeCap: cap,
+            available: available
+        )
+    }
+
     /// 粗估刻录耗时：数据量 ÷（1x 速率 × 倍速），再加固定开销（导入 / 导出 / 写 TOC）。
     /// 不含刻完后的校验。
     public static func estimateDuration(payloadBytes: Int64, speed: Int, media: MediaKind) -> TimeInterval {

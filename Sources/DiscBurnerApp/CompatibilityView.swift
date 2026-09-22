@@ -317,17 +317,49 @@ struct BurnPrepView: View {
                         .font(.system(size: 12))
                         .fixedSize(horizontal: false, vertical: true)
 
-                    compatibilityBox
+                    if prep.isAudio {
+                        audioBox
+                    } else {
+                        compatibilityBox
+                    }
                 }
                 .padding(14)
             }
             Divider()
             buttons
         }
-        .frame(width: 620, height: 520)
+        // 音乐 CD 的确认单没有兼容性清单，别留一大片空白。
+        .frame(width: 620, height: prep.isAudio ? 340 : 520)
         // 默认勾上「自动重命名」：预检既然给出了方案，说明原名确实有风险。
         // 用户上次的选择会覆盖这个默认值。取消勾选后刻录，也就是「保留原名刻录」。
-        .onAppear { autoRename = model.sanitizeNames || !prep.report.renamePlan.isEmpty }
+        .onAppear {
+            // 音乐 CD 盘上没有文件名，没有「重命名」这回事。
+            autoRename = prep.isAudio ? false : (model.sanitizeNames || !prep.report.renamePlan.isEmpty)
+        }
+    }
+
+    /// 音乐 CD 的确认框：这里要说清「盘上没有文件系统」这件事，
+    /// 免得用户刻完在访达里找不到文件、以为刻坏了。
+    private var audioBox: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "music.note.list")
+                    .foregroundColor(.accentColor)
+                Text("音乐 CD（红皮书音轨）")
+                    .font(.system(size: 12, weight: .medium))
+                Spacer()
+            }
+            Text("盘上没有文件系统：电脑（含访达）看不到「文件」，这是红皮书音频盘的正常表现，"
+                + "用 CD 机 / 车载音响 / DVD 播放机放。")
+                .font(.system(size: 11))
+                .fixedSize(horizontal: false, vertical: true)
+            Text("文件名兼容性在这里不适用（音轨不带文件名），所以没有预检项。")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(NSColor.textBackgroundColor)))
     }
 
     private var header: some View {

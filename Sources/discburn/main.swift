@@ -50,9 +50,18 @@ func usage() {
       discburn check <路径…> [--json]       兼容性预检（Windows / Linux / 老设备）
       discburn image <路径…> -o <输出.iso>   只生成光盘映像文件
       discburn burn <路径…> [选项]           刻录到光盘
+      discburn audio <路径…> [选项]          刻成音乐 CD（红皮书音轨，CD 机能放）
       discburn erase [--mode quick|full]    擦除可重写光盘
       discburn eject                        弹出光盘
       discburn --version                    显示版本号
+
+    \(bold("音乐 CD"))
+      音乐 CD 写的是红皮书音轨：把音频文件转成 44.1 kHz / 16 bit / 立体声，盘上没有文件系统，
+      电脑看不到「文件」，CD 机 / 车载音响 / DVD 播放机才认。
+      · 只收音频：MP3 / M4A / AAC / WAV / AIFF / ALAC / FLAC（Ogg / Opus 系统解不了，请先转换）
+      · 只能刻在 CD-R / CD-RW 上，一张 80 分钟的盘大约放 80 分钟音频
+      · 不能追加：盘上有内容时会先擦（只有 CD-RW 擦得掉），音轨按列表顺序写
+      · 倍速默认 8x：老 CD 机对高倍速刻出来的音轨更挑
 
     \(bold("刻录选项"))
       --name <卷标>        光盘卷标（默认 DiscBurn_日期）
@@ -83,6 +92,8 @@ func usage() {
       discburn burn ~/Desktop/report.iso          # 直接刻录已有 ISO
       discburn check ~/Documents                  # 先看看有没有不兼容的文件名
       discburn burn ~/Documents --fix-names       # 自动改名后再刻
+      discburn audio ~/Music/旅行歌单 --speed 8   # 刻成音乐 CD
+      discburn audio ~/Downloads/专辑/            # 文件夹会自动找里面的音频文件
       discburn image ~/Pictures -o ~/Desktop/照片.iso
       discburn erase --mode full
     """)
@@ -94,6 +105,8 @@ struct Options {
     var command = ""
     var paths: [URL] = []
     var volumeName: String?
+    /// 刻数据光盘还是音乐 CD。
+    var mode: DiscMode = .data
     var driveIndex: Int?
     var verify = true
     var eject = true
@@ -171,6 +184,8 @@ func parse(_ arguments: [String]) throws -> Options {
             options.command = "image"
         case "burn":
             options.command = "burn"
+        case "audio", "music", "音乐":
+            options.command = "audio"
         case "erase":
             options.command = "erase"
         case "eject":
@@ -222,6 +237,10 @@ func parse(_ arguments: [String]) throws -> Options {
             options.eraseFirst = true
         case "--close":
             options.closeDisc = true
+        case "--audio", "-a":
+            options.mode = .audioCD
+        case "--data":
+            options.mode = .data
         case "--merge":
             options.appendStrategy = .rewriteMerged
         case "--append":
@@ -486,6 +505,12 @@ func commandBurn(options: Options) throws {
 }
 
 func runJob(_ options: Options, output: URL?) throws {
+    // 音乐 CD 是另一条流水线（没有映像、没有文件系统、不能追加）。
+    if options.mode == .audioCD {
+        guard output == nil else { throw UsageError(message: "音乐 CD 没有映像文件可生成") }
+        try runAudioJob(options)
+        return
+    }
     let imageOptions = makeImageOptions(options)
 
     // 先做兼容性预检：默认只提示，--strict 时有「需处理」的问题就中止。
@@ -542,9 +567,20 @@ func runJob(_ options: Options, output: URL?) throws {
         force: options.force,
         keepWorkspace: options.keep
     )
+    let outcome = try execute(request, options: options)
+    print("")
+    if let image = outcome.imageURL {
+        print(green("✔ 映像已生成：\(image.path)（\(ByteText.human(outcome.payloadBytes))）"))
+    } else {
+        print(green("✔ \(outcome.wasTestBurn ? "测试刻录完成" : "刻录完成")") + dim(" 用时 \(String(format: "%.1f", outcome.duration)) 秒"))
+    }
+}
+
+/// 跑一个刻录任务，并按阶段把进度打到终端上。
+func execute(_ request: BurnRequest, options: Options) throws -> BurnOutcome {
     let job = BurnJob(request: request)
     var lastPhase: JobPhase = .idle
-    let outcome = try job.run { update in
+    return try job.run { update in
         if options.quiet, update.log != nil { return }
         if update.phase != lastPhase {
             lastPhase = update.phase
@@ -559,16 +595,124 @@ func runJob(_ options: Options, output: URL?) throws {
             print("  " + update.message)
         }
     }
+}
+
+/// 音乐 CD：先把音轨排出来给用户看一眼，再走写盘流程。
+///
+/// 这里的清单不是「仅供参考」——它按列表顺序编号，而 `drutil burn -audio` 是按
+/// 文件名字母序写的，暂存时用两位序号前缀把两者对齐，所以看到的顺序就是盘上的顺序。
+func runAudioJob(_ options: Options) throws {
+    guard !options.paths.isEmpty else {
+        throw UsageError(message: "audio 需要至少一个音频文件或文件夹路径")
+    }
+    print(bold("[音频清单] ") + "正在读取音频信息…")
+    let plan = try AudioDisc.plan(items: options.paths) { done, total, url in
+        guard !options.quiet, total > 0, done > 0, done % 10 == 0 else { return }
+        print(dim("  …已读取 \(done)/\(total)：\(url.lastPathComponent)"))
+    }
+    guard !plan.tracks.isEmpty else { throw AudioDiscError.noAudioTracks }
+
+    for track in plan.tracks {
+        var line = String(format: "  %2d.  %@  %@", track.id, AudioDisc.timeText(track.duration), track.title)
+        if !track.isCDQuality { line += yellow("（会转码）") }
+        print(line)
+        if !options.quiet {
+            print(dim("        " + track.sourceURL.path))
+        }
+    }
+    if !plan.skipped.isEmpty {
+        print(yellow("  跳过 \(plan.skipped.count) 个不是音频的内容："))
+        for skip in plan.skipped.prefix(10) {
+            print(dim("    · \(skip.displayName)：\(skip.reason)"))
+        }
+        if plan.skipped.count > 10 {
+            print(dim("    …还有 \(plan.skipped.count - 10) 个"))
+        }
+    }
+
+    print(bold("[时长] ") + "\(plan.summary) · 加上每轨 2 秒间隔占 "
+        + "\(AudioDisc.timeText(plan.requiredSeconds))，一张 CD 有 \(AudioDisc.timeText(plan.capacitySeconds))")
+    try AudioDisc.validate(plan: plan, force: options.force)
+
+    let speed = resolveAudioSpeed(options, plan: plan)
+    if !options.quiet {
+        print(bold("[刻录速度] ") + speed.note)
+        if let caution = speed.caution { print(yellow("  ⚠︎ " + caution)) }
+    }
     print("")
-    if let image = outcome.imageURL {
-        print(green("✔ 映像已生成：\(image.path)（\(ByteText.human(outcome.payloadBytes))）"))
+
+    let request = BurnRequest(
+        items: options.paths,
+        volumeName: "AUDIO",
+        mode: .audioCD,
+        burnOptions: BurnOptions(
+            driveIndex: options.driveIndex,
+            speed: speed.speed,
+            verify: false,
+            ejectWhenDone: options.eject,
+            testBurn: options.test,
+            closeDisc: true,
+            eraseFirst: options.eraseFirst,
+            appendStrategy: .graft
+        ),
+        force: options.force,
+        keepWorkspace: options.keep
+    )
+    let outcome = try execute(request, options: options)
+    print("")
+    if outcome.wasTestBurn {
+        print(green("✔ 测试刻录完成") + dim(" 用时 \(String(format: "%.1f", outcome.duration)) 秒"))
     } else {
-        print(green("✔ \(outcome.wasTestBurn ? "测试刻录完成" : "刻录完成")") + dim(" 用时 \(String(format: "%.1f", outcome.duration)) 秒"))
+        print(green("✔ 刻录完成：音乐 CD \(outcome.audioTrackCount) 轨")
+            + " · 总时长 \(AudioDisc.timeText(outcome.audioDuration))")
+        print(dim("  用时 \(String(format: "%.1f", outcome.duration)) 秒 · "
+            + "盘上没有文件系统，用 CD 机 / 车载音响放；电脑上看不到「文件」"))
+    }
+}
+
+/// 音乐 CD 的倍速：默认 8x，理由跟数据盘不同（老 CD 机对高倍速更挑）。
+func resolveAudioSpeed(_ options: Options, plan: AudioDiscPlan) -> SpeedPlan {
+    let drives = (try? DriveService.listDrives()) ?? []
+    let drive = options.driveIndex.flatMap { index in drives.first { $0.index == index } } ?? drives.first
+    let status = drive.flatMap { try? DriveService.status(driveIndex: $0.index) }
+    let advice = SpeedAdvisor.audioAdvice(
+        reportedSpeeds: status?.writeSpeeds ?? [],
+        trackCount: plan.tracks.count
+    )
+    switch options.speedMode {
+    case .automatic:
+        return SpeedPlan(speed: nil, note: "自动（由驱动器选择，通常是它能跑的最高倍速）", caution: nil)
+    case .fixed(let value):
+        return SpeedPlan(speed: value, note: "\(value)x（手动指定）", caution: advice.caution(for: value))
+    case .recommended:
+        guard let speed = advice.recommended else {
+            return SpeedPlan(speed: nil, note: "自动（\(advice.reason)）", caution: nil)
+        }
+        return SpeedPlan(speed: speed, note: "推荐 \(speed)x · \(advice.reason)", caution: nil)
     }
 }
 
 /// plan 命令：整理后只估算容量与所需介质。
 func runPlanOnly(_ options: Options) throws {
+    // 音乐 CD 的「预演」：只列音轨与时长，不转码、不写盘。
+    if options.mode == .audioCD {
+        let plan = try AudioDisc.plan(items: options.paths)
+        guard !plan.tracks.isEmpty else { throw AudioDiscError.noAudioTracks }
+        print(bold("[预演] ") + "音乐 CD：" + plan.summary)
+        for track in plan.tracks {
+            print(String(format: "  %2d.  %@  %@", track.id, AudioDisc.timeText(track.duration), track.title))
+        }
+        if !plan.skipped.isEmpty {
+            print(yellow("  跳过 \(plan.skipped.count) 个不是音频的内容"))
+        }
+        let verdict = plan.isOverCapacity
+            ? red("✘ 装不下，超了 \(AudioDisc.timeText(-plan.remainingSeconds))")
+            : green("✔ 装得下，还剩 \(AudioDisc.timeText(plan.remainingSeconds))")
+        print("  算上每轨 2 秒间隔占 \(AudioDisc.timeText(plan.requiredSeconds))，"
+            + "一张 CD 有 \(AudioDisc.timeText(plan.capacitySeconds)) → \(verdict)")
+        print(dim("  转成 CD 音轨大约需要 \(ByteText.human(plan.stagedBytes)) 临时空间。"))
+        return
+    }
     // 直接刻录现成映像文件时不用再打包，直接报文件大小
     if let direct = BurnJob.directImageURL(for: options.paths) {
         let bytes = Workspace.fileSize(of: direct)
@@ -876,7 +1020,7 @@ func commandHistory(options: Options) throws {
 
 do {
     Workspace.purgeStale()
-    let options = try parse(Array(CommandLine.arguments.dropFirst()))
+    var options = try parse(Array(CommandLine.arguments.dropFirst()))
     switch options.command {
     case "": usage()
     case "help": usage()
@@ -889,6 +1033,9 @@ do {
     case "plan": try commandPlan(options: options)
     case "image": try commandImage(options: options)
     case "burn": try commandBurn(options: options)
+    case "audio":
+        options.mode = .audioCD
+        try commandBurn(options: options)
     case "erase": try commandErase(options: options)
     case "eject": try commandEject(options: options)
     default:

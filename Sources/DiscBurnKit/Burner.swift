@@ -240,6 +240,58 @@ public enum Burner {
         return commandResult
     }
 
+    // MARK: - 音乐 CD（红皮书音轨）
+
+    /// 拼出「音乐 CD」的写盘参数。
+    ///
+    /// 跟数据光盘有三处不一样：
+    /// - `-audio`：让 DiscRecording 按红皮书写音轨。它会把这个目录里**能解码的音频文件**
+    ///   各写成一条音轨，顺序是**文件名字母序**——所以暂存目录里的文件名都带两位序号前缀，
+    ///   否则「10 某首歌」会排到「2 某首歌」前面；
+    /// - 固定 `-noappendable`：音频盘要一次写完并收尾。多区段的音频盘很多 CD 机只认第一段，
+    ///   而且 `drutil burn -audio` 的追加没有意义（新音轨会盖在旧段之后的空区里）；
+    /// - 固定 `-noverify`：音轨没有文件系统可校验，`-verify` 对音频盘不成立。
+    public static func burnAudioArguments(directory: URL, options: BurnOptions) -> [String] {
+        var arguments: [String] = []
+        if let index = options.driveIndex {
+            arguments += ["-drive", "\(index)"]
+        }
+        arguments.append("burn")
+        arguments.append("-audio")
+        if let speed = options.speed, speed > 0 {
+            arguments += ["-speed", "\(speed)"]
+        }
+        arguments.append("-noappendable")
+        arguments.append("-noverify")
+        if options.testBurn {
+            arguments.append("-test")
+        }
+        if options.ejectWhenDone {
+            arguments.append("-eject")
+        }
+        arguments.append(directory.path)
+        return arguments
+    }
+
+    /// 把暂存目录里的音轨写成音乐 CD。
+    @discardableResult
+    public static func burnAudio(
+        directory: URL,
+        options: BurnOptions,
+        canceller: CommandCanceller? = nil,
+        onProgress: @escaping (BurnProgress) -> Void
+    ) throws -> CommandResult {
+        var parser = BurnOutputParser(phase: .preparing)
+        let arguments = burnAudioArguments(directory: directory, options: options)
+        let result = try Shell.stream("drutil", arguments, canceller: canceller) { line in
+            onProgress(parser.consume(line))
+        }
+        guard result.succeeded else {
+            throw CommandFailure(command: result.command, exitCode: result.exitCode, output: result.output)
+        }
+        return result
+    }
+
     /// 擦除可重写介质。
     @discardableResult
     public static func erase(
