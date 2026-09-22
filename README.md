@@ -212,6 +212,8 @@ macOS 会弹出「DiscBurner.app 想访问可移除宗卷上的文件」，选�
   所以宁可慢一点（80 分钟的盘用 8x 也就刻十来分钟）
 - **刻完**：弹窗和状态栏写「刻录完成：音乐 CD N 轨 · 总时长 X · 用时 Y」。
 
+![音乐 CD](docs/screenshot-audio.png)
+
 命令行等价：`discburn audio <文件或文件夹…>`，只想先看看装不装得下用 `discburn plan <路径…> --audio`。
 
 ### 刻录速度怎么选
