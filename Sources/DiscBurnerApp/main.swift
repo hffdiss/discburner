@@ -140,6 +140,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             model.mode = .audioCD
         }
 
+        // 截屏用：`--demo-video` 直接以「视频 DVD」模式启动（配合 `--demo-items` 看节目列表）。
+        if launchArguments.contains("--demo-video") {
+            model.persistModeChanges = false
+            model.mode = .videoDVD
+        }
+
         // 排错/截屏用：`--demo-items <路径…>` 只把内容加进列表，
         // `--demo-compatibility <路径…>` 再加完内容后打开预检窗口，
         // `--demo-burnprep` 直接摆出「开始刻录？」确认单（光驱里没有可写盘时也能看）。

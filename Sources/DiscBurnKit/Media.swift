@@ -60,6 +60,16 @@ public enum MediaKind: String, CaseIterable {
         }
     }
 
+    /// 是不是 DVD 介质（视频 DVD 只认这一档）。
+    public var isDVD: Bool {
+        switch self {
+        case .dvdR, .dvdRW, .dvdRAM, .dvdPlusR, .dvdPlusRW, .dvdRDL, .dvdPlusRDL, .dvdRWDual, .dvdROM:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// 标称容量（字节），按 2048 字节/扇区计算。
     public var nominalCapacityBytes: Int64 {
         switch self {

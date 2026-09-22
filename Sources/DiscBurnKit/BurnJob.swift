@@ -46,6 +46,8 @@ public struct BurnRequest {
     public var volumeName: String
     /// 这次刻的是数据光盘还是音乐 CD（音乐 CD 走红皮书音轨，没有文件系统）。
     public var mode: DiscMode
+    /// 视频 DVD 用哪种制式（PAL / NTSC）；其它模式不看这个。
+    public var videoStandard: VideoStandard
     public var imageOptions: ImageOptions
     public var burnOptions: BurnOptions
     /// 只生成映像文件而不刻录时设置（此时不写盘）。
@@ -60,6 +62,7 @@ public struct BurnRequest {
         items: [URL],
         volumeName: String,
         mode: DiscMode = .data,
+        videoStandard: VideoStandard = .pal,
         imageOptions: ImageOptions? = nil,
         burnOptions: BurnOptions = BurnOptions(),
         imageOnlyURL: URL? = nil,
@@ -70,6 +73,7 @@ public struct BurnRequest {
         self.items = items
         self.volumeName = volumeName
         self.mode = mode
+        self.videoStandard = videoStandard
         self.imageOptions = imageOptions ?? ImageOptions(volumeName: volumeName)
         self.burnOptions = burnOptions
         self.imageOnlyURL = imageOnlyURL
@@ -89,6 +93,9 @@ public struct BurnOutcome {
     /// 音乐 CD：这次写进去的音轨条数与总时长。
     public var audioTrackCount: Int = 0
     public var audioDuration: TimeInterval = 0
+    /// 视频 DVD：这次写进去的节目数与总时长。
+    public var videoTitleCount: Int = 0
+    public var videoDuration: TimeInterval = 0
 }
 
 /// 端到端任务：整理文件 → 生成映像 → 检查容量 →（可选）擦除 → 写入 → 校验 → 弹出。
@@ -132,6 +139,11 @@ public final class BurnJob {
         // 音乐 CD 是另一条流水线：没有映像、没有文件系统，也不能追加。
         if request.mode == .audioCD {
             return try runAudioDisc(onUpdate: onUpdate)
+        }
+
+        // 视频 DVD 是第三条流水线：先转码成 MPEG-2，排成 VIDEO_TS，再当成一整张映像写下去。
+        if request.mode == .videoDVD {
+            return try runVideoDisc(onUpdate: onUpdate)
         }
 
         // 1. 检查驱动器与介质
@@ -709,6 +721,308 @@ public final class BurnJob {
     }
 
     /// 这次是不是「整盘合并重刻」：选了合并策略，而且盘上确实有内容（驱动器说这盘能追加）。
+    /// 视频 DVD（DVD-Video）的流水线：探测 → 转码 → 排 VIDEO_TS → 做 UDF 映像 → 写盘。
+    ///
+    /// 跟音乐 CD 一样是一条独立的路：盘上虽然有 VIDEO_TS 这个目录，但它不是给电脑看的
+    /// 「文件列表」，而是播放机按规范读的节目结构；也正因为如此，**不能多区段追加**——
+    /// 播放机只认盘开头的 VIDEO_TS。
+    private func runVideoDisc(onUpdate: @escaping (JobUpdate) -> Void) throws -> BurnOutcome {
+        let imageOnly = request.imageOnlyURL != nil
+        var drive: OpticalDrive?
+        var mediaBefore: DiscStatus?
+        var status = DiscStatus()
+
+        if imageOnly {
+            report(onUpdate, .checking, 0.02, "只生成映像：跳过光驱检查")
+        } else {
+            report(onUpdate, .checking, 0.02, "正在检测光驱…")
+            let drives = try DriveService.listDrives()
+            guard let selected = selectDrive(from: drives) else { throw BurnError.noDrive }
+            drive = selected
+            let current = try DriveService.status(driveIndex: selected.index)
+            mediaBefore = current
+            status = current
+            guard status.isPresent else { throw BurnError.noMedia }
+            // 视频 DVD 只能刻在 DVD 上：CD 装不下，蓝光的 BDMV 是另一套结构。
+            guard status.media.isDVD || status.media == .unknown else {
+                throw VideoDVDError.requiresDVDMedia(status.media.displayName)
+            }
+
+            let canErase = status.erasable || status.media.isRewritable
+            // 「盘上有内容」不能看段数：空白盘的 discinfo 也会写 Sessions: 1。
+            let hasContent = Multisession.needsGraft(status: status)
+            var eraseBefore = request.burnOptions.eraseFirst
+            if !request.burnOptions.testBurn {
+                guard status.media.isWritable else { throw BurnError.mediaNotWritable(status.media.displayName) }
+                if hasContent {
+                    guard canErase else {
+                        throw VideoDVDError.needsBlankDisc(
+                            sessions: status.sessions ?? 1,
+                            media: status.media.displayName
+                        )
+                    }
+                    // 视频 DVD 不能追加，盘上有东西就只能先擦掉。
+                    eraseBefore = true
+                } else if !status.writability.canBurn {
+                    guard canErase else { throw BurnError.mediaClosed(status.media.displayName) }
+                    eraseBefore = true
+                }
+                if request.burnOptions.eraseFirst, !canErase {
+                    throw BurnError.notRewritable(status.media.displayName)
+                }
+            }
+            report(onUpdate, .checking, 0.04, "光驱：\(selected.displayName) · 介质：\(status.summary)")
+
+            if eraseBefore {
+                report(
+                    onUpdate,
+                    .erasing,
+                    0.2,
+                    hasContent ? "盘上已有内容，视频 DVD 不能追加：正在擦除光盘…" : "正在擦除光盘…"
+                )
+                try Burner.erase(mode: .quick, driveIndex: selected.index, canceller: canceller) { progress in
+                    self.report(
+                        onUpdate,
+                        .erasing,
+                        self.scale(progress.fraction, 0.2, 0.26),
+                        progress.message.isEmpty ? "正在擦除光盘…" : progress.message,
+                        log: progress.rawLine
+                    )
+                }
+                status = try DriveService.status(driveIndex: selected.index)
+                report(onUpdate, .erasing, 0.26, "擦除完成 · \(status.summary)")
+            }
+        }
+
+        // 1. 探测每个视频文件
+        report(onUpdate, .staging, 0.06, "正在读取视频信息…")
+        let capacity = status.writableBytes ?? VideoDVD.capacityBytes(for: status.media)
+        let standard = request.videoStandard
+        let plan = try VideoDVD.plan(
+            items: request.items,
+            standard: standard,
+            capacityBytes: capacity
+        ) { done, total, url in
+            guard total > 0 else { return }
+            self.report(
+                onUpdate,
+                .staging,
+                0.06 + 0.10 * Double(done) / Double(total),
+                "已读取 \(done)/\(total)：\(url.lastPathComponent)"
+            )
+        }
+        try checkCancelled()
+        guard !plan.sources.isEmpty else { throw VideoDVDError.noVideoFiles }
+        if !plan.skipped.isEmpty {
+            var log = ""
+            for skip in plan.skipped.prefix(50) {
+                log += "· 跳过 \(skip.displayName)：\(skip.reason)\n"
+            }
+            if plan.skipped.count > 50 {
+                log += "…（还有 \(plan.skipped.count - 50) 个被跳过）\n"
+            }
+            report(
+                onUpdate,
+                .staging,
+                0.16,
+                "视频 DVD 只收视频文件，已跳过 \(plan.skipped.count) 个",
+                log: log.trimmingCharacters(in: .newlines)
+            )
+        }
+        report(
+            onUpdate,
+            .staging,
+            0.17,
+            "\(plan.summary) · 视频码率 \(plan.bitrateText) · 预计占 "
+                + "\(ByteText.human(plan.estimatedBytes)) / \(ByteText.human(plan.capacityBytes))"
+        )
+        try VideoDVD.validate(plan: plan, force: request.force)
+        let missing = VideoDVD.missingTools
+        if !missing.isEmpty {
+            throw VideoDVDError.missingTool(name: missing.joined(separator: "、"), hint: VideoDVD.installHint)
+        }
+
+        // 2. 转码 + 打包都要落在临时目录里
+        let required = plan.stagedBytes
+        if let available = Workspace.availableSpace(at: URL(fileURLWithPath: NSTemporaryDirectory())),
+           available < required + 64 * 1024 * 1024 {
+            throw VideoDVDError.notEnoughSpace(required: required, available: available)
+        }
+
+        let workspace = try Workspace()
+        self.workspace = workspace
+        if request.keepWorkspace {
+            report(onUpdate, .staging, 0.19, "临时目录：\(workspace.root.path)")
+        }
+
+        // 3. 转成 DVD 兼容的 MPEG-PS
+        report(onUpdate, .staging, 0.2, "正在把 \(plan.sources.count) 个节目转成 DVD 格式（MPEG-2）…")
+        let encoded = try VideoDVDStager.encode(
+            sources: plan.sources,
+            into: workspace.staging,
+            standard: plan.standard,
+            widescreen: plan.widescreen,
+            videoBitrateKbps: plan.videoBitrateKbps,
+            canceller: canceller,
+            onProgress: { done, total, title in
+                guard total > 0 else { return }
+                self.report(
+                    onUpdate,
+                    .staging,
+                    0.2 + 0.3 * Double(done) / Double(total),
+                    "已转码 \(done)/\(total)：\(title)"
+                )
+            },
+            onLog: { line in
+                self.report(onUpdate, .staging, nil, "转码中…", log: line)
+            }
+        )
+        try checkCancelled()
+
+        // 4. 排成 VIDEO_TS
+        let chapters = plan.sources.map {
+            VideoDVD.chapterMarks(duration: $0.duration, every: VideoDVD.chapterSeconds)
+        }
+        report(onUpdate, .buildingImage, 0.52, "正在生成 DVD 结构（VIDEO_TS）…")
+        let dvdRoot = workspace.root.appendingPathComponent("dvd", isDirectory: true)
+        try VideoDVDStager.author(
+            rootDirectory: dvdRoot,
+            titles: encoded,
+            standard: plan.standard,
+            widescreen: plan.widescreen,
+            chapters: chapters,
+            canceller: canceller,
+            onLog: { line in
+                self.report(onUpdate, .buildingImage, nil, "正在生成 DVD 结构…", log: line)
+            }
+        )
+        try checkCancelled()
+        report(onUpdate, .buildingImage, 0.62, "DVD 结构已就绪，正在生成映像…")
+
+        // 5. 做成 UDF 1.02 映像（DVD-Video 规范要求的文件系统）
+        let imageURL = workspace.root.appendingPathComponent("dvd-video.iso")
+        try VideoDVDStager.buildImage(
+            source: dvdRoot,
+            outputURL: imageURL,
+            volumeName: request.volumeName,
+            canceller: canceller,
+            onProgress: { fraction in
+                self.report(
+                    onUpdate,
+                    .buildingImage,
+                    self.scale(fraction, 0.62, 0.7),
+                    "正在生成映像… \(Int((fraction * 100).rounded()))%"
+                )
+            },
+            onLog: { line in
+                self.report(onUpdate, .buildingImage, nil, "正在生成映像…", log: line)
+            }
+        )
+        try checkCancelled()
+        let payloadBytes = Workspace.fileSize(of: imageURL)
+        report(
+            onUpdate,
+            .buildingImage,
+            0.7,
+            "映像已就绪：\(ByteText.human(payloadBytes)) · \(plan.summary)"
+        )
+
+        if imageOnly {
+            let destination = request.imageOnlyURL ?? imageURL
+            if destination != imageURL {
+                try? FileManager.default.removeItem(at: destination)
+                try FileManager.default.copyItem(at: imageURL, to: destination)
+            }
+            report(onUpdate, .finished, 1.0, "映像已生成：\(destination.path)", log: destination.path)
+            cleanup()
+            return BurnOutcome(
+                imageURL: destination,
+                payloadBytes: payloadBytes,
+                mediaBefore: nil,
+                mediaAfter: nil,
+                duration: Date().timeIntervalSince(startedAt),
+                wasTestBurn: false,
+                videoTitleCount: plan.sources.count,
+                videoDuration: plan.totalDuration
+            )
+        }
+
+        let driveIndex = drive?.index ?? request.burnOptions.driveIndex
+        // 6. 写盘
+        let action = request.burnOptions.testBurn ? "测试刻录（不会写入介质）" : "刻录"
+        report(onUpdate, .preparing, 0.72, "\(action)：视频 DVD（\(plan.sources.count) 个节目）")
+        var parser = BurnOutputParser(phase: .preparing)
+        let ticker = BurnProgressTicker()
+        let estimated = SpeedAdvisor.estimateDuration(
+            payloadBytes: payloadBytes,
+            speed: request.burnOptions.speed ?? 0,
+            media: status.media
+        )
+        if estimated > 0, !request.burnOptions.testBurn {
+            ticker.start(estimatedSeconds: estimated) { elapsed in
+                let fraction = min(0.9, 0.74 + 0.24 * (elapsed / estimated))
+                self.report(
+                    onUpdate,
+                    .burning,
+                    fraction,
+                    "正在刻录视频 DVD… " + SpeedAdvisor.progressText(elapsed: elapsed, remaining: estimated - elapsed)
+                )
+            }
+        }
+        defer { ticker.stop() }
+        var burnOptions = request.burnOptions
+        // 视频 DVD 必须收尾：留着「可追加」的盘，播放机会去读一个没有 VIDEO_TS 的旧段。
+        burnOptions.closeDisc = true
+        if let index = driveIndex { burnOptions.driveIndex = index }
+        _ = try Burner.burn(image: imageURL, options: burnOptions, canceller: canceller) { line in
+            var update = parser.consume(line.rawLine ?? line.message)
+            update.message = update.message.isEmpty ? "正在刻录视频 DVD…" : update.message
+            self.report(
+                onUpdate,
+                .burning,
+                self.scale(update.fraction, 0.72, 0.99),
+                update.message,
+                log: update.rawLine
+            )
+        }
+        ticker.stop()
+        try checkCancelled()
+
+        let mediaAfter = driveIndex.flatMap { try? DriveService.status(driveIndex: $0) }
+        if !request.burnOptions.testBurn {
+            BurnHistory.record(
+                BurnRecord(
+                    volumeName: request.volumeName,
+                    mediaKind: status.media.displayName,
+                    mediaID: status.mediaID,
+                    sessionIndex: 1,
+                    payloadBytes: payloadBytes,
+                    fileCount: plan.sources.count,
+                    topLevelItems: plan.sources.map { $0.title },
+                    wasTestBurn: false,
+                    filesystem: "DVD-Video（\(plan.sources.count) 个节目 · \(AudioDisc.timeText(plan.totalDuration))"
+                        + " · \(plan.standard.localizedName) \(plan.aspectText)）"
+                )
+            )
+        }
+        let finishedText = request.burnOptions.testBurn
+            ? "测试刻录完成：视频 DVD \(plan.sources.count) 个节目"
+            : "刻录完成：视频 DVD \(plan.sources.count) 个节目 · 总时长 \(AudioDisc.timeText(plan.totalDuration))"
+        report(onUpdate, .finished, 1.0, finishedText)
+        cleanup()
+        return BurnOutcome(
+            // 这里特意不回报 imageURL：那个 .iso 在临时目录里，`cleanup()` 之后已经删了；
+            // imageURL 只在「只要映像、不刻盘」那条路上有值（界面据此显示「映像已生成」）。
+            imageURL: nil,
+            payloadBytes: payloadBytes,
+            mediaBefore: mediaBefore,
+            mediaAfter: mediaAfter,
+            duration: Date().timeIntervalSince(startedAt),
+            wasTestBurn: request.burnOptions.testBurn,
+            videoTitleCount: plan.sources.count,
+            videoDuration: plan.totalDuration
+        )
+    }
     private func isMergeWholeDisc(status: DiscStatus) -> Bool {
         request.burnOptions.appendStrategy == .rewriteMerged
             && Multisession.needsGraft(status: status)

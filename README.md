@@ -3,6 +3,8 @@
 在 macOS 上把**任意文件**刻录到 CD / DVD / 蓝光光盘的原生程序，支持外置 USB 光驱。
 带图形界面（拖拽即可）和一个命令行工具。写盘用 macOS 自带的 `drutil`、映像用自带 `hdiutil`
 或 `xorriso`（追加刻录需要它，`brew install xorriso`），不需要装驱动、不需要 root 权限。
+除了「把文件写进盘里」，还能刻**音乐 CD**（红皮书音轨）和**视频 DVD**（DVD-Video，
+播放机/蓝光机能放的影碟；用到 `ffmpeg` 与 `dvdauthor`）。
 
 ![界面预览](docs/preview.png)
 
@@ -12,6 +14,10 @@
 - **音乐 CD（红皮书音轨）**：把 MP3 / M4A / AAC / WAV / AIFF / ALAC / FLAC 刻成 CD 机、车载音响能直接放的音频盘。
   音轨按列表顺序编号（拖进来的顺序就是盘上的顺序），逐条转成 44.1 kHz / 16 bit / 立体声再写成音轨；
   盘上**没有文件系统**——电脑（含访达）看不到「文件」，这是红皮书音频盘的正常表现。一张 80 分钟的 CD-R 约放 80 分钟音频
+- **视频 DVD（DVD-Video）**：把 MP4 / MOV / MKV / AVI / TS 等转成 DVD 认的 MPEG-2，
+  排成标准的 `VIDEO_TS` 目录，DVD 播放机 / 蓝光机 / 播放软件都能放，遥控器上还能**跳章节**（每个节目每 5 分钟一个）。
+  视频码率按素材总时长和这张盘的容量自动算：一张单层 DVD 放得下大约 2 小时。
+  同样**不能追加**（播放机只认盘开头的 `VIDEO_TS`），而且只能用 DVD±R / DVD±RW
 - **已有文件列表**：左栏最上面就是这张盘里已经刻了什么（文件名、大小、区段数），不用先挂载到「访达」看。
   多区段盘按扇区读**全部区段**，显示的是整张盘真正有的内容，不是系统挂载的那一段
 - **导出到文件夹**：访达里的那个卷是系统挂载的结果，多区段盘上只有第一段——点「导出到文件夹…」
@@ -52,14 +58,14 @@ open dist/DiscBurner.app   # 打开图形界面
 命令行工具在 `.build-manual/universal/discburn`，可以先自检：
 
 ```bash
-./.build-manual/universal/discburn-selftest   # 524 项单元/集成自检
+./.build-manual/universal/discburn-selftest   # 654 项单元/集成自检
 ```
 
 ## 安装与分发
 
 不想自己编译的话，直接去 **[Releases](https://github.com/hffdiss/discburner/releases)** 下最新的
 `DiscBurner-<版本>.dmg`，打开后把「光盘刻录」拖进「应用程序」就行；
-`DiscBurner-<版本>.zip` 是解压即用的版本。最新发布版本是 **1.4.1**（音乐 CD 是主分支上的新功能，尚未发版）。
+`DiscBurner-<版本>.zip` 是解压即用的版本。最新发布版本是 **1.5.0**（这个版本加上了视频 DVD）。
 
 `./build.sh` 会产出三样东西：
 
@@ -123,7 +129,7 @@ VERSION=1.2.3 ./build.sh      # 临时指定版本号（不改 VERSION 文件）
 
 1. 检查工作区是否干净、这个 tag 有没有用过、GitHub 凭据能不能访问仓库
 2. 用新版本号跑 `./build.sh`（产物是 `dist/DiscBurner-<版本>.dmg` / `.zip`）
-3. 跑 524 项自检，不过不发版
+3. 跑 654 项自检，不过不发版
 4. 把版本号写回 `VERSION`、提交、打 `vX.Y.Z` tag 并推送（`main` 由 post-commit 钩子推）
 5. 调 GitHub API 建 Release，把 `.dmg` 和 `.zip` 作为附件传上去
 
@@ -217,6 +223,46 @@ macOS 会弹出「DiscBurner.app 想访问可移除宗卷上的文件」，选�
 命令行等价：`discburn audio <文件或文件夹…>`，只想先看看装不装得下用 `discburn plan <路径…> --audio`。
 
 ### 刻录速度怎么选
+### 刻视频 DVD（DVD-Video）
+
+同一个「光盘类型」里切成**「视频 DVD」**：左栏变成**节目列表**（第几段、多长、什么分辨率），
+底下一行写「合计 1:52:40 · 预计占 3.8 GiB / 4.38 GiB」。这一档刻出来的是**影碟**，
+不是「盘里放几个 mp4 文件」——DVD 播放机、蓝光机、播放软件都认，遥控器上能跳段。
+
+- **添加**：文件夹会**递归找视频文件**并摊平成一个个节目；不是视频的内容会被跳过并写明原因。
+  支持的格式：MP4 / MOV / MKV / AVI / M4V / MPEG / VOB / TS / M2TS / WMV / FLV / WebM / 3GP 等
+- **顺序**：列表里排第几，盘上就是第几段（title）。播完自动接下一段，最后一段播完停下
+- **转码**：每个节目先转成 DVD 认的 MPEG-2（PAL 720×576 / 25 帧，或 NTSC 720×480 / 29.97 帧），
+  音频统一 MP2 192 kbps / 48 kHz / 立体声；比例不同的素材**补黑边**，不裁切。
+  没有音轨的素材会自动补一条静音轨（DVD 要求每段都有音频流）
+- **码率**：不是固定值。按素材总时长和这张盘的容量**倒推**一个能装下、画质也还行的码率
+  （1.5–8 Mbps，往下取整到 100 kbps）。界面右栏「视频设置」里直接显示这一次用多少
+- **章节**：每个节目每 5 分钟打一个章节点，遥控器上按「下一章」就能跳
+- **介质**：**只能刻在 DVD±R / DVD±RW 上**（CD 只装得下 700 MB，放不下一部片子的 MPEG-2；
+  蓝光的 BDMV 是另一套结构），而且**不能追加**：盘上已有内容时，可重写的 DVD±RW 会先擦再刻
+- **倍速**：默认 **4x**。刻完是给家用播放机读的，播放机的纠错能力不如电脑光驱，
+  高倍速刻出来的盘在老旧播放机上更容易卡（4.38 GiB 用 4x 也就刻一刻钟）
+- **制式**：默认 **PAL**（中国大陆 / 欧洲，25 帧）；给美国 / 日本的播放机用就切 **NTSC**
+- **画面比例**：一个 VTS 只能有一种比例，所以整张盘统一——只要有一部是宽屏就按 16:9 做，
+  4:3 的素材左右补黑边（用像素长宽比 64:45 写进流里，播放机上形状是对的）
+- **需要两个外部工具**：`ffmpeg`（转码）和 `dvdauthor`（排 `VIDEO_TS`）。没装时界面会在
+  「视频设置」里标红并给出安装指引，命令行会直接报缺什么：
+
+  ```bash
+  brew install dvdauthor        # 排 VIDEO_TS
+  brew install ffmpeg           # 转 MPEG-2；Intel Mac 见下面的说明
+  ```
+
+  Intel Mac 上 Homebrew 已经不再提供 ffmpeg 的现成二进制包（`brew install ffmpeg` 会报
+  `no bottle available` 然后开始从头编译，一两个小时起步）。这种机器建议到
+  [evermeet.cx](https://evermeet.cx/ffmpeg/) 下载静态版 `ffmpeg` / `ffprobe`，解压后放进
+  `/usr/local/bin/`（首次运行可能要 `xattr -dr com.apple.quarantine /usr/local/bin/ffmpeg`）。
+- **刻完**：弹窗和状态栏写「刻录完成：视频 DVD N 个节目 · 总时长 X · 用时 Y」。
+  刻完会自动校验（这一档有文件系统可校验，跟数据盘一样）
+
+![视频 DVD](docs/screenshot-video.png)
+
+命令行等价：`discburn dvd <文件或文件夹…>`，只想先看看码率与容量用 `discburn plan <路径…> --dvd`。
 
 速度不是越快越好：一次写入介质写坏了这张盘就废了，所以默认给的是**推荐**值 —— 按当前介质类型取的稳妥档：
 
@@ -247,6 +293,10 @@ macOS 会弹出「DiscBurner.app 想访问可移除宗卷上的文件」，选�
 选了驱动器没上报的档位（例如在只报 3/4/6/8x 的 DVD+R 上选 48x），还会再加一句
 `驱动器上报的倍速是 3x / 4x / 6x / 8x，没有 48x：可能被直接拒绝。`
 命令行接受任意数字，超上限时同样会警告：
+
+音乐 CD 与视频 DVD 这两档的建议值跟数据盘不同，因为刻完是给**影碟机 / CD 机**读的，
+那些机器纠错能力不如电脑光驱：音频盘默认 **8x**（上限 16x），视频 DVD 默认 **4x**（上限 8x）。
+切到这两档时，「刻录速度」下面的说明行会换成对应的理由。
 
 ```text
 $ discburn plan ~/资料 --speed 16
@@ -334,6 +384,7 @@ discburn contents --image ~/x.iso          # 读取光盘映像里的内容
 discburn history                           # 本机刻过什么
 discburn plan ~/Movies ~/a.pdf --name 存档  # 只估算大小，不写盘
 discburn plan ~/Music/歌单 --audio       # 音乐 CD 预演：列音轨、算时长，不写盘
+discburn plan ~/Movies/纪录片 --dvd      # 视频 DVD 预演：列节目、算码率，不写盘
 discburn check ~/Documents                 # 兼容性预检（Windows / Linux / 老设备）
 
 # 刻录
@@ -347,7 +398,13 @@ discburn audio ~/Music/旅行歌单 --speed 8   # 刻成音乐 CD（CD 机能放
 discburn audio ~/Downloads/整张专辑/        # 文件夹会自动摊平成音轨
 discburn burn ~/Music/歌 --audio            # 跟 audio 命令等价
 
+# 视频 DVD
+discburn dvd ~/Movies/婚礼跟拍 --name WEDDING --speed 4
+discburn dvd ~/Movies/老片修复 --ntsc       # 给美国 / 日本的播放机用 NTSC
+discburn burn ~/Movies/婚礼 --dvd           # 跟 dvd 命令等价
+
 # 其它
+discburn image ~/Movies/纪录片 --dvd -o ~/Desktop/纪录片.iso   # 只生成 DVD 映像
 discburn image ~/Pictures -o ~/Desktop/照片.iso   # 只生成 ISO
 discburn erase --mode quick                       # 擦除（会要求输入 yes）
 discburn eject
@@ -366,6 +423,8 @@ discburn eject
 | `--erase-first` | 刻之前先快速擦除（仅可重写盘） |
 | `--close` | 刻完关闭光盘（默认不关，可继续追加） |
 | `--audio` / `-a` | 这次刻**音乐 CD**（红皮书音轨）：只收音频文件，默认 8x，一次写完并收尾 |
+| `--dvd` | 这次刻**视频 DVD**（DVD-Video）：只收视频文件，默认 4x，一次写完并收尾 |
+| `--ntsc` / `--pal` | 视频 DVD 用哪种制式（默认 PAL） |
 | `--data` | 恢复成数据光盘（默认） |
 | `--merge` | 可重写介质上追加时「整盘合并重刻」：读旧内容 + 擦盘 + 单段刻完（慢，但三边看到的一样） |
 | `--append` | 追加新段（默认）：写得快，但 macOS / Linux 默认只看得到第一段 |
@@ -548,10 +607,16 @@ sudo mount -t iso9660 -o ro,sbsector=7536 /dev/sr0 /mnt   # 7536 = 最后一段�
 等连着刻了几张都稳，再在同一个下拉框里往上加。
 
 **可以刻音乐 CD / DVD 影碟吗？**
-音乐 CD **已经支持**：右栏最上面把「光盘类型」切成「音乐 CD」，拖进音频文件就行（见「刻音乐 CD」一节）。
-视频 DVD 影碟还没有做：它要 MPEG-2 编码 + `VIDEO_TS` 的 IFO/VOB 打包（`ffmpeg` + `dvdauthor`），
-本机没装这两个工具，做了也没法在这台机器上验证，所以先不放进来自欺欺人。
-想把视频文件刻进盘里，现在可以用「数据光盘」——不少电视/播放机的 USB 或数据盘模式能直接放盘里的 MP4。
+两种都支持。右栏最上面把「光盘类型」切成「音乐 CD」就是音轨盘，切成「视频 DVD」就是影碟
+（分别见「刻音乐 CD」「刻视频 DVD」两节）。
+视频 DVD 要把片子转成 MPEG-2 再排成 `VIDEO_TS`，所以额外需要 `ffmpeg` 与 `dvdauthor`；
+没装时界面会直接标出来并给出安装命令。只想把 mp4 文件原样放进盘里、不要求播放机认，
+那还是用「数据光盘」——不少电视的 USB 或数据盘模式能直接放盘里的 MP4。
+
+**为什么视频 DVD 刻完在访达里只有一堆 VIDEO_TS 文件？**
+影碟本来就是这么存的：盘上是 `VIDEO_TS` 目录里的 IFO / BUP / VOB 文件，节目结构写在 IFO 里，
+不是「电影.mp4」这种文件。用 DVD 播放机 / 蓝光机 / VLC 这类播放软件打开这张盘就能正常播，
+遥控器上还能按章节跳。想看到能双击播放的文件，那就刻数据盘。
 
 **为什么音乐 CD 刻完在访达里看不到文件？**
 红皮书音频盘**没有文件系统**：盘上是一条条音轨，不是「文件 + 目录」。CD 机、车载音响、DVD 播放机认它，
@@ -643,8 +708,18 @@ docker run --rm --privileged -v /tmp:/host node:22-slim bash -c '
   其中「真跑 `afinfo` + `afconvert`」那一组是自己造 WAV 再走一遍真实转码，确认转出来确实是
   44.1 kHz / 16 bit / 立体声、时长不变、暂存目录里的文件名顺序 == 界面上音轨的顺序。
   **拿一张空白 CD-R 真点火刻一张、再放进 CD 机/车机验证这一步还没做**（要写盘，得先确认用哪张盘）
+- **视频 DVD（自检已覆盖，真机点火还没验）**：`ffprobe` 输出解析（分辨率 / 宽高比 / 时长 / 有没有音轨 /
+  手机竖拍的旋转元数据 / 隔行标记）、制式与像素长宽比换算（PAL 16:9 → 64:45、4:3 → 16:15，
+  NTSC 40:33 / 10:11）、码率与容量倒推（含「十小时连最低码率都装不下」要给 0 而不是硬刻）、
+  卷标清洗（中文洗成下划线、最多 32 字符）、章节点、`dvdauthor` XML（`vmgm` 里必须写 video 制式，
+  否则 dvdauthor 不生成 `VIDEO_TS.IFO`）、XML 转义都有自检；
+  其中「真跑」那一组是造两段测试视频（一段带声音、一段没有音轨），走完整条
+  `ffmpeg` 转码 → `dvdauthor` 排 `VIDEO_TS` → `mkisofs -dvd-video` 做映像，
+  再核对转出来的确实是 `mpeg2video` 720×576、没音轨的素材补出了静音轨、`VIDEO_TS.IFO` /
+  `VTS_01_0.IFO` / `VTS_01_1.VOB` 都在、映像里含 UDF 1.02（`NSR02`）标记。
+  **拿一张空白 DVD±R 真点火刻一张、再放进播放机验证这一步还没做**（要写盘，得先确认用哪张盘）
 - `hdiutil makehybrid` 生成映像、`drutil burn` 真实写盘、`drutil erase/eject` 参数拼装
-- 命令行与图形界面均能构建、运行；524 项自检全部通过（含速度建议、常用档位与耗时换算，以及音乐 CD 的音轨摊平 / 时长容量 / 倍速 / 写盘参数 / 真跑 `afinfo`+`afconvert` 五组）
+- 命令行与图形界面均能构建、运行；654 项自检全部通过（含速度建议、常用档位与耗时换算、音乐 CD 的音轨摊平 / 时长容量 / 倍速 / 写盘参数 / 真跑 `afinfo`+`afconvert` 五组，以及视频 DVD 的 `ffprobe` 解析 / 制式与像素长宽比 / 码率与容量 / `dvdauthor` XML / 真跑 `ffmpeg`+`dvdauthor`+`mkisofs` 六组）
 - 通用二进制（x86_64 + arm64）、App 包结构、ad-hoc 签名校验、DMG 挂载后直接运行
 - 光盘写满/被关闭后 `Writability` 字段为空的情况（改用 `discinfo` 的 Disc Status 判断，不再误报「状态未知」）
 - **真实刻录**：同一张 DVD+R 上连续追加 7 段全部成功（含最后两次从图形界面点「开始刻录」的完整流程），

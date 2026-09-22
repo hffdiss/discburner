@@ -198,6 +198,39 @@ public enum SpeedAdvisor {
 
     /// 粗估刻录耗时：数据量 ÷（1x 速率 × 倍速），再加固定开销（导入 / 导出 / 写 TOC）。
     /// 不含刻完后的校验。
+    /// 视频 DVD 的倍速建议。
+    ///
+    /// DVD 视频盘跟数据盘的目标不一样：刻完是拿去给 DVD 播放机放的，
+    /// 而家用播放机的纠错能力不如电脑光驱，高倍速刻出来的盘在老旧播放机上更容易卡顿。
+    /// 4x 是公认的稳妥档，超过 8x 对视频盘没有意义（4.38 GiB 用 4x 也就刻一刻钟）。
+    public static func videoAdvice(reportedSpeeds: [Int], titleCount: Int = 1) -> SpeedAdvice {
+        let available = Array(Set(reportedSpeeds.filter { $0 > 0 })).sorted()
+        let sweet = 4
+        let cap = 8
+        var recommended: Int?
+        var reason: String
+
+        if let best = available.last(where: { $0 <= sweet }) {
+            recommended = best
+            reason = "视频 DVD 用 \(best)x：刻完要拿去给 DVD 播放机读，慢一点播放机更不容易卡"
+        } else if let lowest = available.first {
+            recommended = lowest
+            reason = "驱动器只支持 \(available.map { "\($0)x" }.joined(separator: "/") )，最低一档 \(lowest)x 也高于视频盘常用的 \(sweet)x"
+        } else {
+            recommended = sweet
+            reason = "驱动器没有上报倍速，视频盘按常用的 \(sweet)x"
+        }
+
+        return SpeedAdvice(
+            recommended: recommended,
+            reason: reason,
+            conservativeCap: cap,
+            available: available
+        )
+    }
+
+    /// 粗估刻录耗时：数据量 ÷（1x 速率 × 倍速），再加固定开销（导入 / 导出 / 写 TOC）。
+    /// 不含刻完后的校验。
     public static func estimateDuration(payloadBytes: Int64, speed: Int, media: MediaKind) -> TimeInterval {
         guard speed > 0, payloadBytes > 0 else { return 0 }
         let rate = media.bytesPerSecondAt1x * Double(speed)

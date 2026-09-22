@@ -319,6 +319,8 @@ struct BurnPrepView: View {
 
                     if prep.isAudio {
                         audioBox
+                    } else if prep.isVideo {
+                        videoBox
                     } else {
                         compatibilityBox
                     }
@@ -328,13 +330,15 @@ struct BurnPrepView: View {
             Divider()
             buttons
         }
-        // 音乐 CD 的确认单没有兼容性清单，别留一大片空白。
-        .frame(width: 620, height: prep.isAudio ? 340 : 520)
+        // 音乐 CD / 视频 DVD 的确认单没有兼容性清单，别留一大片空白。
+        .frame(width: 620, height: prep.isAudio ? 340 : (prep.isVideo ? 380 : 520))
         // 默认勾上「自动重命名」：预检既然给出了方案，说明原名确实有风险。
         // 用户上次的选择会覆盖这个默认值。取消勾选后刻录，也就是「保留原名刻录」。
         .onAppear {
-            // 音乐 CD 盘上没有文件名，没有「重命名」这回事。
-            autoRename = prep.isAudio ? false : (model.sanitizeNames || !prep.report.renamePlan.isEmpty)
+            // 音乐 CD / 视频 DVD 盘上没有需要改名的文件名，没有「重命名」这回事。
+            autoRename = (prep.isAudio || prep.isVideo)
+                ? false
+                : (model.sanitizeNames || !prep.report.renamePlan.isEmpty)
         }
     }
 
@@ -379,6 +383,33 @@ struct BurnPrepView: View {
         .padding(14)
     }
 
+    /// 视频 DVD 的确认框：说清「盘上是 VIDEO_TS 结构」以及画面 / 码率是按什么定的，
+    /// 免得用户刻完在访达里找不到「文件」，以为刻坏了。
+    private var videoBox: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "film.stack")
+                    .foregroundColor(.accentColor)
+                Text("视频 DVD（DVD-Video）")
+                    .font(.system(size: 12, weight: .medium))
+                Spacer()
+            }
+            Text("盘上是标准的 VIDEO_TS 结构：用 DVD 播放机 / 蓝光机 / 播放软件看，"
+                + "访达里只会看到一个 VIDEO_TS 文件夹，看不到「电影文件」，这是正常的。")
+                .font(.system(size: 11))
+                .fixedSize(horizontal: false, vertical: true)
+            Text("文件名兼容性在这里不适用（盘上只有 VIDEO_TS / VTS_xx_x 这些固定名字），所以没有预检项。")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("转码要用 ffmpeg，排 VIDEO_TS 要用 dvdauthor；片长越长码率越低，全程比较慢，请留足时间。")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(NSColor.textBackgroundColor)))
+    }
     private var compatibilityBox: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {

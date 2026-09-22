@@ -10,6 +10,7 @@ import Foundation
 public enum DiscMode: String, CaseIterable, Identifiable, Hashable {
     case data
     case audioCD
+    case videoDVD
 
     public var id: String { rawValue }
 
@@ -17,6 +18,7 @@ public enum DiscMode: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .data: return "数据光盘"
         case .audioCD: return "音乐 CD"
+        case .videoDVD: return "视频 DVD"
         }
     }
 
@@ -27,11 +29,17 @@ public enum DiscMode: String, CaseIterable, Identifiable, Hashable {
         case .audioCD:
             return "把音频文件转成红皮书音轨：CD 机、车载音响、DVD 播放机都能直接放。"
                 + "盘上没有文件系统，电脑看不到「文件」；一张 80 分钟的 CD-R 大约能放 80 分钟音频。"
+        case .videoDVD:
+            return "把视频转成 DVD-Video（MPEG-2），排成标准的 VIDEO_TS 目录：DVD 播放机、"
+                + "蓝光机、电脑都能放，遥控器上还能跳章节。一张单层 DVD 大约放 2 小时。"
         }
     }
 
     /// 音乐 CD 用不上「卷标 / 文件系统 / 多区段追加」这些设置。
     public var usesFileSystemOptions: Bool { self == .data }
+
+    /// 盘上有没有用户能直接读到的文件（音乐 CD 没有；视频 DVD 有 VIDEO_TS，但那不是「文件列表」）。
+    public var hasVisibleFiles: Bool { self == .data }
 }
 
 /// 一条准备写进音乐 CD 的音轨。

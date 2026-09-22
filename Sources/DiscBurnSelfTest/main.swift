@@ -1760,7 +1760,7 @@ func writeWAV(
 }
 
 run("音乐 CD：光盘类型与音频扩展名") {
-    expectEqual(DiscMode.allCases.count, 2, "两种光盘类型")
+    expectEqual(DiscMode.allCases.count, 3, "三种光盘类型")
     expectEqual(DiscMode.data.localizedName, "数据光盘", "数据光盘的名字")
     expectEqual(DiscMode.audioCD.localizedName, "音乐 CD", "音乐 CD 的名字")
     expect(DiscMode.data.usesFileSystemOptions, "数据光盘才有卷标 / 文件系统这些设置")
@@ -2031,6 +2031,328 @@ run("音乐 CD：真跑 afinfo 与 afconvert（转出红皮书音轨）") {
     expect(abs(stagedFirst.duration - 3) < 0.05, "转码后时长不变")
 }
 
+// MARK: - 视频 DVD（DVD-Video）
+
+run("视频 DVD：光盘类型与视频扩展名") {
+    expectEqual(DiscMode.allCases.count, 3, "三种光盘类型")
+    expectEqual(DiscMode.videoDVD.localizedName, "视频 DVD", "视频 DVD 的名字")
+    expectEqual(DiscMode.videoDVD.detail.contains("VIDEO_TS"), true, "说明里点出 VIDEO_TS")
+    expect(!DiscMode.videoDVD.usesFileSystemOptions, "视频 DVD 用不上 Joliet / 追加这些设置")
+    expect(DiscMode.data.hasVisibleFiles, "数据光盘在访达里看得到文件")
+    expect(!DiscMode.videoDVD.hasVisibleFiles, "视频 DVD 看到的是 VIDEO_TS，不是文件列表")
+
+    for name in ["电影.mp4", "片子.mkv", "老录像.avi", "碟.vob", "手机.MOV", "录制.m2ts", "网课.webm"] {
+        expect(VideoDVD.isVideoFile(URL(fileURLWithPath: "/tmp/\(name)")), "\(name) 是视频文件")
+    }
+    for name in ["歌.mp3", "清单.txt", "系统.iso", "无扩展名", "电影.mp4.txt"] {
+        expect(!VideoDVD.isVideoFile(URL(fileURLWithPath: "/tmp/\(name)")), "\(name) 不是视频文件")
+    }
+
+    // 视频 DVD 只能刻在 DVD 上，CD 与蓝光都不行（蓝光的 BDMV 是另一套结构）。
+    expect(MediaKind.dvdPlusR.isDVD, "DVD+R 是 DVD 介质")
+    expect(MediaKind.dvdRW.isDVD, "DVD-RW 是 DVD 介质")
+    expect(MediaKind.dvdRDL.isDVD, "DVD-R DL 是 DVD 介质")
+    expect(!MediaKind.cdR.isDVD, "CD-R 不是 DVD 介质")
+    expect(!MediaKind.bdR.isDVD, "BD-R 不是 DVD 介质")
+}
+
+run("视频 DVD：ffprobe 输出解析") {
+    let wide = """
+    {"streams":[
+      {"codec_type":"video","width":1920,"height":1080,"display_aspect_ratio":"16:9","field_order":"progressive"},
+      {"codec_type":"audio","channels":2}
+    ],"format":{"duration":"125.400000"}}
+    """
+    let wideInfo = try VideoDVD.parseFFProbe(wide)
+    expectEqual(wideInfo.width, 1920, "读到宽度")
+    expectEqual(wideInfo.height, 1080, "读到高度")
+    expect(abs(wideInfo.displayAspect - 16.0 / 9) < 0.01, "读到宽高比")
+    expect(wideInfo.isWidescreen, "1920×1080 是宽屏")
+    expect(wideInfo.hasAudio, "有音轨")
+    expect(!wideInfo.isInterlaced, "progressive 不用反交错")
+    expect(abs(wideInfo.duration - 125.4) < 0.001, "读到时长")
+
+    let old = """
+    {"streams":[{"codec_type":"video","width":720,"height":576,"sample_aspect_ratio":"16:15",
+      "field_order":"tt"}],"format":{"duration":"60"}}
+    """
+    let oldInfo = try VideoDVD.parseFFProbe(old)
+    expect(!oldInfo.isWidescreen, "720×576 且 16:15 的像素比 → 4:3")
+    expect(!oldInfo.hasAudio, "没有音轨要标出来")
+    expect(oldInfo.isInterlaced, "field_order=tt 是隔行，转码前要反交错")
+    expect(abs(oldInfo.displayAspect - 4.0 / 3) < 0.01, "宽高比按「宽 × 像素比 ÷ 高」算")
+
+    // 手机竖着拍的片子：ffmpeg 转码时会自动转正，算比例前也得先跟着转。
+    let portrait = """
+    {"streams":[{"codec_type":"video","width":1920,"height":1080,
+      "side_data_list":[{"rotation":-90}],"display_aspect_ratio":"16:9"},
+      {"codec_type":"audio"}],"format":{"duration":"30"}}
+    """
+    let portraitInfo = try VideoDVD.parseFFProbe(portrait)
+    expectEqual(portraitInfo.width, 1080, "旋转 90 度后宽高要对调")
+    expectEqual(portraitInfo.height, 1920, "旋转 90 度后宽高要对调")
+    expect(!portraitInfo.isWidescreen, "转正之后是竖屏，不该当宽屏")
+
+    var threw = false
+    do { _ = try VideoDVD.parseFFProbe("{\"streams\":[{\"codec_type\":\"audio\"}]}") } catch { threw = true }
+    expect(threw, "没有视频轨道要报错")
+
+    threw = false
+    do { _ = try VideoDVD.parseFFProbe("这不是 JSON") } catch { threw = true }
+    expect(threw, "ffprobe 输出不是 JSON 要报错")
+
+    threw = false
+    do {
+        _ = try VideoDVD.parseFFProbe("{\"streams\":[{\"codec_type\":\"video\",\"width\":640,\"height\":480}],\"format\":{}}")
+    } catch { threw = true }
+    expect(threw, "没有时长要报错")
+}
+
+run("视频 DVD：制式与画面比例") {
+    expectEqual(VideoStandard.pal.width, 720, "PAL 横向都是 720")
+    expectEqual(VideoStandard.pal.height, 576, "PAL 是 576 行")
+    expectEqual(VideoStandard.ntsc.height, 480, "NTSC 是 480 行")
+    expectEqual(VideoStandard.pal.gopSize, 15, "PAL 的 GOP 上限 15")
+    expectEqual(VideoStandard.ntsc.gopSize, 18, "NTSC 的 GOP 上限 18")
+
+    // 方形像素画布：16:9 的 PAL 是 1024×576，4:3 是 768×576。
+    expectEqual(VideoStandard.pal.squarePixelWidth(widescreen: true), 1024, "PAL 16:9 的方形像素宽")
+    expectEqual(VideoStandard.pal.squarePixelWidth(widescreen: false), 768, "PAL 4:3 的方形像素宽")
+    expectEqual(VideoStandard.pal.sampleAspect(widescreen: true), "64/45", "PAL 16:9 的像素长宽比")
+    expectEqual(VideoStandard.pal.sampleAspect(widescreen: false), "16/15", "PAL 4:3 的像素长宽比")
+    expectEqual(VideoStandard.ntsc.sampleAspect(widescreen: true), "40/33", "NTSC 16:9 的像素长宽比")
+    expectEqual(VideoStandard.ntsc.sampleAspect(widescreen: false), "10/11", "NTSC 4:3 的像素长宽比")
+
+    // 滤镜链必须带 setsar，否则播放机上的画面会被拉扁。
+    let filters = VideoDVDStager.encodeFilters(standard: .pal, widescreen: true, isInterlaced: false)
+    expect(filters.contains("scale=1024:576"), "先缩到方形像素画布")
+    expect(filters.contains("pad=1024:576"), "再补黑边保证不裁切")
+    expect(filters.contains("scale=720:576"), "最后压成 DVD 的 720×576")
+    expect(filters.contains("setsar=64/45"), "标上 16:9 的像素长宽比")
+    expect(!filters.contains("yadif"), "逐行素材不反交错")
+
+    let interlaced = VideoDVDStager.encodeFilters(standard: .ntsc, widescreen: false, isInterlaced: true)
+    expect(interlaced.contains("yadif=0"), "隔行素材先反交错")
+    expect(interlaced.contains("setsar=10/11"), "NTSC 4:3 的像素长宽比")
+}
+
+run("视频 DVD：码率、容量与卷标") {
+    let single = VideoDVD.capacityBytes(for: .dvdPlusR)
+    expectEqual(single, VideoDVD.defaultCapacityBytes, "单层 DVD 就是 4.38 GiB")
+    expectEqual(VideoDVD.capacityBytes(for: .dvdPlusRDL), VideoDVD.dualLayerCapacityBytes, "双层盘按双层的容量算")
+    expectEqual(VideoDVD.capacityBytes(for: .cdR), MediaKind.cdR.nominalCapacityBytes, "别的介质按标称容量")
+
+    // 一小时的片子：码率要落在 1.5–8 Mbps 之间，而且真按这个码率算要装得下。
+    let oneHour = VideoDVD.recommendedVideoBitrate(totalDuration: 3600, capacityBytes: single)
+    expect(oneHour >= VideoDVD.minimumVideoBitrateKbps, "一小时能放下")
+    expect(oneHour <= VideoDVD.maximumVideoBitrateKbps, "码率不超过上限")
+    expectEqual(oneHour % 100, 0, "码率取整到 100 kbps")
+    let oneHourBytes = VideoDVD.estimatedBytes(totalDuration: 3600, videoBitrateKbps: oneHour)
+    expect(oneHourBytes <= single, "按推荐码率算应该装得下")
+
+    // 短片子：不会超过上限，也不会因为「盘太空」就给个天文数字。
+    let short = VideoDVD.recommendedVideoBitrate(totalDuration: 120, capacityBytes: single)
+    expectEqual(short, VideoDVD.maximumVideoBitrateKbps, "短片按上限给")
+
+    // 十小时：连最低码率都塞不下，必须给 0 让调用方报「超容量」。
+    expectEqual(VideoDVD.recommendedVideoBitrate(totalDuration: 36000, capacityBytes: single), 0, "十小时装不下")
+
+    expectEqual(VideoDVD.estimatedBytes(totalDuration: 0, videoBitrateKbps: 4000), 0, "没时长就是 0 字节")
+
+    // 卷标：ISO 9660 的卷标是 ASCII 字段，中文进去会变乱码，所以要洗掉。
+    expectEqual(VideoDVD.volumeLabel("婚礼 2026"), "2026", "中文与空格换成下划线后把首尾的下划线去掉")
+    expectEqual(VideoDVD.volumeLabel("my wedding disc"), "MY_WEDDING_DISC", "转成大写、空格变下划线")
+    expectEqual(VideoDVD.volumeLabel("中文卷标"), "VIDEO_DVD", "洗没了就用默认名")
+    expectEqual(VideoDVD.volumeLabel(""), "VIDEO_DVD", "空卷标用默认名")
+    expect(VideoDVD.volumeLabel(String(repeating: "A", count: 40)).count == 32, "卷标最多 32 个字符")
+
+    // 章节：太短的片子不打章节，长片每 5 分钟一个。
+    expectEqual(VideoDVD.chapterMarks(duration: 60, every: 300), [0], "一分钟的片子只有开头一个章节点")
+    let marks = VideoDVD.chapterMarks(duration: 1000, every: 300)
+    expectEqual(marks.count, 4, "1000 秒的片子打 4 个章节点")
+    expectEqual(marks.first, 0, "第一个章节点永远是 0")
+    expectEqual(VideoDVD.chapterMarks(duration: 0, every: 300), [0], "没有时长也返回开头")
+}
+
+run("视频 DVD：dvdauthor 的 XML") {
+    let titles = [
+        URL(fileURLWithPath: "/tmp/暂存/01 - 婚礼 & 宴会.mpg"),
+        URL(fileURLWithPath: "/tmp/暂存/02 - 花絮.mpg"),
+    ]
+    let xml = VideoDVD.dvdauthorXML(
+        destination: URL(fileURLWithPath: "/tmp/dvd"),
+        standard: .pal,
+        widescreen: true,
+        titles: titles,
+        chapters: [[0, 300], [0]]
+    )
+    // 这几条都是实测撞出来的：少了 vmgm 里那段 video，dvdauthor 不会生成 VIDEO_TS.IFO。
+    expect(xml.contains("<vmgm>"), "要有 vmgm")
+    expect(xml.contains("<video format=\"pal\" aspect=\"16:9\" />"), "vmgm 与 titles 都要写清制式和比例")
+    expect(xml.contains("dest=\"/tmp/dvd\""), "输出目录要写进 XML")
+    expect(xml.contains("chapters=\"0:00:00,0:05:00\""), "章节点写成人能看懂的时间")
+    expect(xml.contains("jump title 2;"), "第一个节目播完跳到第二个")
+    expect(xml.contains("<post> exit; </post>"), "最后一个节目播完就停")
+    // 路径里的 & 不转义会让 XML 直接解析失败。
+    expect(xml.contains("婚礼 &amp; 宴会"), "路径里的 & 要转义")
+    expect(!xml.contains("婚礼 & 宴会"), "不能留着没转义的 &")
+
+    let ntsc = VideoDVD.dvdauthorXML(
+        destination: URL(fileURLWithPath: "/tmp/dvd"),
+        standard: .ntsc,
+        widescreen: false,
+        titles: [URL(fileURLWithPath: "/tmp/暂存/01.mpg")]
+    )
+    expect(ntsc.contains("<video format=\"ntsc\" aspect=\"4:3\" />"), "NTSC 4:3 要写对")
+    expect(ntsc.contains("exit;"), "只有一个节目时直接结束")
+
+    expectEqual(VideoDVD.xmlEscape("a<b>c\"d'e&f"), "a&lt;b&gt;c&quot;d&apos;e&amp;f", "XML 转义")
+}
+
+run("视频 DVD：收集文件与错误提示") {
+    let folder = try makeTempDirectory("video")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let sub = folder.appendingPathComponent("子目录", isDirectory: true)
+    try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+    for name in ["电影.mp4", "花絮.mkv"] {
+        try "x".write(to: folder.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+    try "x".write(to: sub.appendingPathComponent("预告.mov"), atomically: true, encoding: .utf8)
+    try "x".write(to: folder.appendingPathComponent("说明.txt"), atomically: true, encoding: .utf8)
+    try "x".write(to: folder.appendingPathComponent(".DS_Store"), atomically: true, encoding: .utf8)
+
+    let collected = VideoDVD.collectVideoFiles(from: [folder, folder.appendingPathComponent("说明.txt")])
+    expectEqual(collected.videos.count, 3, "文件夹要递归找视频")
+    expectEqual(collected.skipped.count, 1, "明确点名的非视频文件要被记下来")
+    expectEqual(collected.skipped.first?.displayName, "说明.txt", "跳过的是哪个文件要说清")
+
+    // 文件夹里的非视频文件是被「不收」，不算「跳过」；整个文件夹里一个视频都没有才算跳过。
+    expectEqual(VideoDVD.collectVideoFiles(from: [folder]).skipped.count, 0, "文件夹里的杂项文件不算跳过")
+    let emptyFolder = folder.appendingPathComponent("全是文档", isDirectory: true)
+    try FileManager.default.createDirectory(at: emptyFolder, withIntermediateDirectories: true)
+    try "x".write(to: emptyFolder.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    let none = VideoDVD.collectVideoFiles(from: [emptyFolder])
+    expectEqual(none.videos.count, 0, "没有视频的文件夹收不到东西")
+    expectEqual(none.skipped.first?.reason.contains("没有视频文件") ?? false, true, "要说明这个文件夹里没有视频")
+
+    expectEqual(VideoDVD.videoTitle(from: URL(fileURLWithPath: "/tmp/01 - 婚礼.mp4")), "婚礼", "显示名去掉扩展名与序号")
+    expectEqual(VideoDVD.videoTitle(from: URL(fileURLWithPath: "/tmp/2001 太空漫游.mp4")), "2001 太空漫游", "四位数开头的名字不能被当成序号")
+    expectEqual(VideoDVD.safeFileName("a/b:c"), "a-b-c", "文件名里的斜杠和冒号要换掉")
+
+    expect(VideoDVDError.requiresDVDMedia("CD-R").localizedDescription.contains("DVD"), "说清只能用 DVD")
+    expect(VideoDVDError.requiresDVDMedia("CD-R").localizedDescription.contains("CD"), "顺便解释 CD 为什么不行")
+    expect(VideoDVDError.needsBlankDisc(sessions: 2, media: "DVD-RW").localizedDescription.contains("不能追加"), "说清不能追加")
+    expect(VideoDVDError.noVideoFiles.localizedDescription.contains("MKV"), "空列表时告诉用户支持哪些格式")
+    expect(VideoDVDError.missingTool(name: "ffmpeg", hint: "装一下").localizedDescription.contains("ffmpeg"), "缺工具要说清缺哪个")
+    expect(VideoDVDError.tooManyTitles(120).localizedDescription.contains("99"), "节目数上限要说出来")
+}
+
+run("视频 DVD：真跑 ffmpeg + dvdauthor + mkisofs") {
+    guard VideoDVD.isReady else {
+        print("  （这台机器没装 \(VideoDVD.missingTools.joined(separator: "、"))，跳过真跑那一组）")
+        return
+    }
+    let folder = try makeTempDirectory("video-real")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let ffmpeg = VideoDVD.ffmpegPath!
+
+    // 造两段测试素材：一段 4:3 带声音，一段竖屏不带声音（正好试「补静音」那条路）。
+    let wideFile = folder.appendingPathComponent("宽屏片段.mp4")
+    let silentFile = folder.appendingPathComponent("无声片段.mp4")
+    for (destination, size, withAudio) in [(wideFile, "854x480", true), (silentFile, "480x640", false)] {
+        var arguments = [
+            "-y", "-hide_banner", "-nostats",
+            "-f", "lavfi", "-i", "testsrc2=size=\(size):rate=25:duration=2",
+        ]
+        if withAudio {
+            arguments += ["-f", "lavfi", "-i", "sine=frequency=440:duration=2"]
+        }
+        arguments += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
+        if withAudio {
+            arguments += ["-c:a", "aac", "-shortest"]
+        }
+        arguments.append(destination.path)
+        let result = try Shell.run(ffmpeg, arguments)
+        expect(result.succeeded, "造测试素材：\(destination.lastPathComponent)")
+    }
+
+    let plan = try VideoDVD.plan(items: [wideFile, silentFile], standard: .pal)
+    expectEqual(plan.sources.count, 2, "两个节目都收进来了")
+    expectEqual(plan.skipped.count, 0, "没有要跳过的")
+    expect(plan.sources[0].hasAudio, "第一个有音轨")
+    expect(!plan.sources[1].hasAudio, "第二个没有音轨")
+    expect(abs(plan.totalDuration - 4) < 0.3, "两段合起来 4 秒左右")
+    expect(plan.videoBitrateKbps > 0, "算得出码率")
+    expect(plan.widescreen, "只要有一部是宽屏，整张盘就按 16:9 做（竖屏那部会被补黑边）")
+
+    let staging = folder.appendingPathComponent("staging", isDirectory: true)
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+    let encoded = try VideoDVDStager.encode(
+        sources: plan.sources,
+        into: staging,
+        standard: plan.standard,
+        widescreen: plan.widescreen,
+        videoBitrateKbps: plan.videoBitrateKbps
+    )
+    expectEqual(encoded.count, 2, "两段都转好了")
+    expectEqual(encoded[0].lastPathComponent, "01 - 宽屏片段.mpg", "暂存文件名 = 序号 + 标题")
+
+    // 转出来的必须是 DVD 认的 MPEG-PS：MPEG-2 + 720×576 + MP2 48 kHz 立体声。
+    let encodedInfo = try VideoDVD.info(for: encoded[0])
+    expectEqual(encodedInfo.width, 720, "转码后宽度是 DVD 的 720")
+    expectEqual(encodedInfo.height, 576, "转码后高度是 DVD 的 576")
+    expect(encodedInfo.hasAudio, "原本有音轨的当然还在")
+    let silentInfo = try VideoDVD.info(for: encoded[1])
+    expect(silentInfo.hasAudio, "原本没有音轨的素材要补出一条静音音轨（DVD 要求每条节目都有音频流）")
+    expectEqual(silentInfo.height, 576, "补静音之后仍然是 DVD 的分辨率")
+    let probe = try Shell.run(VideoDVD.ffprobePath!, [
+        "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,profile",
+        "-of", "default=nw=1", encoded[0].path,
+    ])
+    expect(probe.output.contains("mpeg2video"), "视频编码要变成 mpeg2video（dvdauthor 只认它）")
+
+    // 排 VIDEO_TS
+    let dvdRoot = folder.appendingPathComponent("dvd", isDirectory: true)
+    try VideoDVDStager.author(
+        rootDirectory: dvdRoot,
+        titles: encoded,
+        standard: plan.standard,
+        widescreen: plan.widescreen,
+        chapters: plan.sources.map { VideoDVD.chapterMarks(duration: $0.duration, every: VideoDVD.chapterSeconds) }
+    )
+    let fileManager = FileManager.default
+    for name in ["VIDEO_TS.IFO", "VTS_01_0.IFO", "VTS_01_1.VOB"] {
+        expect(
+            fileManager.fileExists(atPath: dvdRoot.appendingPathComponent("VIDEO_TS/\(name)").path),
+            "VIDEO_TS 里要有 \(name)"
+        )
+    }
+    expect(
+        fileManager.fileExists(atPath: dvdRoot.appendingPathComponent("AUDIO_TS").path),
+        "根目录还要有 AUDIO_TS"
+    )
+    // dvdauthor 的控制文件不能留在这一层，否则会被一起刻进光盘根目录。
+    expect(
+        !fileManager.fileExists(atPath: dvdRoot.appendingPathComponent("dvdauthor.xml").path),
+        "dvdauthor.xml 不能留在要做成映像的那一层目录里"
+    )
+
+    // 做成映像：必须是 UDF 1.02（NSR02）+ 里面真有 VIDEO_TS。
+    let image = folder.appendingPathComponent("dvd-video.iso")
+    try VideoDVDStager.buildImage(
+        source: dvdRoot,
+        outputURL: image,
+        volumeName: "测试 盘"
+    )
+    expect(Workspace.fileSize(of: image) > 0, "映像不是空的")
+    let data = try Data(contentsOf: image)
+    expect(data.range(of: Data("NSR02".utf8)) != nil, "UDF 1.02（DVD-Video 规范要求的版本）")
+    expect(data.range(of: Data("VIDEO_TS.IFO".utf8)) != nil, "映像里有 VIDEO_TS.IFO")
+    expect(data.range(of: Data("VTS_01_1.VOB".utf8)) != nil, "映像里有 VOB 数据")
+
+    expectEqual(VideoDVD.volumeLabel("测试 盘"), "VIDEO_DVD", "中文卷标会被洗掉")
+}
 print("")
 if failureCount == 0 {
     print("全部 \(checkCount) 项检查通过 ✅")

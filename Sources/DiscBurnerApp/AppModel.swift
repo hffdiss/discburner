@@ -9,6 +9,10 @@ struct FileItem: Identifiable, Hashable {
     let byteCount: Int64
     /// 音乐 CD 模式下这条音轨的时长（秒）；数据光盘模式不用。
     var duration: TimeInterval = 0
+    /// 视频 DVD 模式下这条节目的画面说明（「1280×720 · 16:9 · 有声音」）；其它模式不用。
+    var videoSummary: String = ""
+    /// 视频 DVD 模式：这条节目是不是宽屏（整张盘要按「有没有宽屏」统一画面比例）。
+    var isWidescreenVideo: Bool = false
 
     var name: String { url.lastPathComponent }
     var sizeText: String { isDirectory ? ByteText.human(byteCount) + "/" : ByteText.human(byteCount) }
@@ -50,6 +54,8 @@ struct BurnPrep: Identifiable {
     let summary: String
     /// 音乐 CD 的确认单：不展示文件名兼容性（盘上没有文件名）。
     var isAudio: Bool = false
+    /// 视频 DVD 的确认单：同样不展示文件名兼容性（盘上是 VIDEO_TS 结构）。
+    var isVideo: Bool = false
 
     var hasIssues: Bool { !report.isPerfect }
     var hasErrors: Bool { report.hasErrors }
@@ -83,8 +89,8 @@ enum SpeedChoice: Hashable {
 final class AppModel: ObservableObject {
     @Published var items: [FileItem] = []
     @Published var volumeName: String = AppModel.defaultVolumeName()
-    /// 音乐 CD 模式下「刚才加了什么、跳过了什么」的一句话提示。
-    @Published var audioSkipNotice: String?
+    /// 音乐 CD / 视频 DVD 模式下「刚才加了什么、跳过了什么」的一句话提示。
+    @Published var skipNotice: String?
     /// 刻数据光盘还是音乐 CD。两种盘的写盘方式完全不同，界面也跟着换一套说法。
     @Published var mode: DiscMode =
         DiscMode(rawValue: UserDefaults.standard.string(forKey: AppModel.discModeKey) ?? "") ?? .data {
@@ -95,9 +101,17 @@ final class AppModel: ObservableObject {
             }
             if mode == .audioCD {
                 filterItemsToAudio()
+            } else if mode == .videoDVD {
+                filterItemsToVideo()
             }
             scheduleCompatibilityScan()
         }
+    }
+
+    /// 视频 DVD 的画面制式（PAL / NTSC）。
+    @Published var videoStandard: VideoStandard =
+        VideoStandard(rawValue: UserDefaults.standard.string(forKey: AppModel.videoStandardKey) ?? "") ?? .pal {
+        didSet { UserDefaults.standard.set(videoStandard.rawValue, forKey: AppModel.videoStandardKey) }
     }
 
     /// 截屏参数（`--demo-audio`）切模式时不写 UserDefaults，免得改掉用户真实的选择。
@@ -191,6 +205,7 @@ final class AppModel: ObservableObject {
     static let appearanceKey = "DiscBurner.appearance"
     static let mergeBeforeBurnKey = "DiscBurner.mergeBeforeBurn"
     static let discModeKey = "DiscBurner.discMode"
+    static let videoStandardKey = "DiscBurner.videoStandard"
 
     private var job: BurnJob?
     private var pollTimer: Timer?
@@ -226,17 +241,22 @@ final class AppModel: ObservableObject {
 
     var capacityBytes: Int64? {
         // 音乐 CD 按时间算容量，不按字节。
-        mode == .audioCD ? nil : status.writableBytes
+        if mode == .audioCD { return nil }
+        // 视频 DVD：拿得到就用驱动器报的可用空间，拿不到按单层 DVD 算。
+        if mode == .videoDVD { return status.writableBytes ?? VideoDVD.defaultCapacityBytes }
+        return status.writableBytes
     }
 
     var isOverCapacity: Bool {
         if mode == .audioCD { return isAudioOverCapacity }
+        if mode == .videoDVD { return isVideoOverCapacity }
         guard let capacity = capacityBytes, capacity > 0 else { return false }
         return totalBytes > capacity
     }
 
     var usageFraction: Double {
         if mode == .audioCD { return audioUsageFraction }
+        if mode == .videoDVD { return videoUsageFraction }
         guard let capacity = capacityBytes, capacity > 0 else { return 0 }
         return min(1, Double(totalBytes) / Double(capacity))
     }
@@ -272,7 +292,11 @@ final class AppModel: ObservableObject {
 
     /// 估算刻录耗时用的字节数：数据盘是文件大小，音乐 CD 是转码后的音轨大小。
     var payloadBytesForEstimate: Int64 {
-        mode == .audioCD ? audioPayloadBytes : totalBytes
+        switch mode {
+        case .audioCD: return audioPayloadBytes
+        case .videoDVD: return videoEstimatedBytes
+        case .data: return totalBytes
+        }
     }
 
     /// 还有音轨的时长没读出来（`afinfo` 正在后台跑）。
@@ -280,9 +304,71 @@ final class AppModel: ObservableObject {
         mode == .audioCD && items.contains { $0.duration <= 0 }
     }
 
+    // MARK: - 视频 DVD 的时长与容量
+
+    /// 所有节目的时长合计。
+    var videoTotalDuration: TimeInterval {
+        items.reduce(0) { $0 + $1.duration }
+    }
+
+    /// 这张盘的可用字节数。
+    var videoCapacityBytes: Int64 {
+        status.writableBytes ?? VideoDVD.defaultCapacityBytes
+    }
+
+    /// 按总时长倒推出来的视频码率（kbps）；0 表示装不下。
+    var videoBitrateKbps: Int {
+        VideoDVD.recommendedVideoBitrate(
+            totalDuration: videoTotalDuration,
+            capacityBytes: videoCapacityBytes
+        )
+    }
+
+    /// 转码 + 打包后预计占用的字节数（不是源文件大小——MPEG-2 的码率是算出来的）。
+    var videoEstimatedBytes: Int64 {
+        VideoDVD.estimatedBytes(totalDuration: videoTotalDuration, videoBitrateKbps: videoBitrateKbps)
+    }
+
+    /// 整张盘按哪种画面比例做：只要有一部宽屏就统一 16:9（4:3 的素材左右补黑边）。
+    var videoWidescreen: Bool {
+        items.contains { $0.isWidescreenVideo }
+    }
+
+    var videoAspectText: String { videoWidescreen ? "16:9" : "4:3" }
+
+    var videoBitrateText: String {
+        guard videoBitrateKbps > 0 else { return "装不下" }
+        return String(format: "%.1f Mbps", Double(videoBitrateKbps) / 1000)
+    }
+
+    var isVideoOverCapacity: Bool {
+        !items.isEmpty && (videoBitrateKbps <= 0 || videoEstimatedBytes > videoCapacityBytes)
+    }
+
+    var videoRemainingBytes: Int64 { videoCapacityBytes - videoEstimatedBytes }
+
+    var videoUsageFraction: Double {
+        guard videoCapacityBytes > 0, !items.isEmpty else { return 0 }
+        return min(1, Double(videoEstimatedBytes) / Double(videoCapacityBytes))
+    }
+
+    /// 还有节目的时长没读出来（`ffprobe` 正在后台跑）。
+    var videoDurationsPending: Bool {
+        mode == .videoDVD && items.contains { $0.duration <= 0 }
+    }
+
+    /// 视频 DVD 这套流水线缺不缺外部工具（ffmpeg / ffprobe / dvdauthor）。
+    var videoMissingTools: [String] {
+        VideoDVD.missingTools
+    }
+
     func add(urls: [URL]) {
         if mode == .audioCD {
             addAudio(urls: urls)
+            return
+        }
+        if mode == .videoDVD {
+            addVideo(urls: urls)
             return
         }
         var known = Set(items.map { $0.url.standardizedFileURL.path })
@@ -327,7 +413,7 @@ final class AppModel: ObservableObject {
 
     func clearItems() {
         items.removeAll()
-        audioSkipNotice = nil
+        skipNotice = nil
         scheduleCompatibilityScan()
     }
 
@@ -366,16 +452,16 @@ final class AppModel: ObservableObject {
                 ))
             }
         }
-        audioSkipNotice = skipped.isEmpty ? nil : audioSkipSummary(skipped)
+        skipNotice = skipped.isEmpty ? nil : skipSummary(skipped, for: "音乐 CD", unit: "音频")
         guard !added.isEmpty else { return }
         items.append(contentsOf: added)
         measureDurations(of: added)
     }
 
-    private func audioSkipSummary(_ skipped: [String]) -> String {
+    private func skipSummary(_ skipped: [String], for disc: String, unit: String) -> String {
         let head = skipped.prefix(3).joined(separator: "、")
         let tail = skipped.count > 3 ? " 等 \(skipped.count) 个" : ""
-        return "音乐 CD 只收音频文件，已跳过：\(head)\(tail)"
+        return "\(disc) 只收\(unit)文件，已跳过：\(head)\(tail)"
     }
 
     /// 读每条音轨的时长（`afinfo` 很轻，一条几十毫秒）。
@@ -420,11 +506,102 @@ final class AppModel: ObservableObject {
         items = result
         measureDurations(of: result)
         if removed > 0 {
-            audioSkipNotice = "切到音乐 CD 后去掉了 \(removed) 个不是音频的项目"
+            skipNotice = "切到音乐 CD 后去掉了 \(removed) 个不是音频的项目"
         }
     }
 
     // MARK: - 兼容性预检
+    // MARK: - 视频 DVD 的列表
+
+    /// 视频 DVD 模式下的「添加」：文件夹摊平成视频文件，非视频内容不进列表。
+    ///
+    /// 理由跟音乐 CD 一样：一张 DVD 就是一个个节目（title），没有「文件夹」这个概念。
+    /// 列表顺序就是盘上节目的顺序，播放机遥控器上「下一段」也是这个顺序。
+    private func addVideo(urls: [URL]) {
+        var known = Set(items.map { $0.url.standardizedFileURL.path })
+        var added: [FileItem] = []
+        var skipped: [String] = []
+        for url in urls {
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            let candidates: [URL]
+            if isDirectory {
+                candidates = VideoDVD.videoFiles(inDirectory: url)
+                if candidates.isEmpty { skipped.append("\(url.lastPathComponent)（文件夹里没有视频）") }
+            } else if VideoDVD.isVideoFile(url) {
+                candidates = [url]
+            } else {
+                skipped.append(url.lastPathComponent)
+                continue
+            }
+            for candidate in candidates {
+                let standardized = candidate.standardizedFileURL
+                guard !known.contains(standardized.path) else { continue }
+                known.insert(standardized.path)
+                added.append(FileItem(
+                    url: standardized,
+                    isDirectory: false,
+                    byteCount: Workspace.fileSize(of: standardized)
+                ))
+            }
+        }
+        skipNotice = skipped.isEmpty ? nil : skipSummary(skipped, for: "视频 DVD", unit: "视频")
+        guard !added.isEmpty else { return }
+        items.append(contentsOf: added)
+        measureVideoInfo(of: added)
+    }
+
+    /// 读每个节目的时长、分辨率、有没有声音（`ffprobe` 一个文件几十毫秒，放后台跑）。
+    private func measureVideoInfo(of added: [FileItem]) {
+        guard !added.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var measured: [UUID: (TimeInterval, String, Bool)] = [:]
+            for item in added {
+                guard let info = try? VideoDVD.info(for: item.url) else { continue }
+                let summary = "\(info.width)×\(info.height) · "
+                    + (info.isWidescreen ? "16:9" : "4:3")
+                    + (info.hasAudio ? "" : " · 无音轨（会补静音）")
+                measured[item.id] = (info.duration, summary, info.isWidescreen)
+            }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.items = self.items.map { item in
+                    guard let value = measured[item.id] else { return item }
+                    var updated = item
+                    updated.duration = value.0
+                    updated.videoSummary = value.1
+                    updated.isWidescreenVideo = value.2
+                    return updated
+                }
+            }
+        }
+    }
+
+    /// 从别的模式切到视频 DVD 时，把列表里不是视频的内容摊平 / 去掉。
+    private func filterItemsToVideo() {
+        var known = Set<String>()
+        var result: [FileItem] = []
+        for item in items {
+            let candidates = item.isDirectory ? VideoDVD.videoFiles(inDirectory: item.url) : [item.url]
+            for candidate in candidates {
+                let standardized = candidate.standardizedFileURL
+                guard VideoDVD.isVideoFile(standardized) else { continue }
+                guard !known.contains(standardized.path) else { continue }
+                known.insert(standardized.path)
+                result.append(FileItem(
+                    url: standardized,
+                    isDirectory: false,
+                    byteCount: Workspace.fileSize(of: standardized)
+                ))
+            }
+        }
+        let removed = items.count - result.count
+        items = result
+        measureVideoInfo(of: result)
+        if removed > 0 {
+            skipNotice = "切到视频 DVD 后去掉了 \(removed) 个不是视频的项目"
+        }
+    }
 
     private var imageOptions: ImageOptions {
         let fs = preset.options
@@ -488,6 +665,22 @@ final class AppModel: ObservableObject {
             return ("这张 \(status.media.displayName) 上已经有内容，而音乐 CD 不能追加刻录。"
                 + "请换一张空白 CD-R，或用可重写的 CD-RW 擦除后再刻。", .error)
         }
+        // 视频 DVD 同理：播放机只认盘开头的 VIDEO_TS，追加出来的分段它读不到。
+        if mode == .videoDVD {
+            guard status.isPresent else {
+                return ("视频 DVD 要刻在 DVD 上：一张单层 DVD 放得下大约 2 小时的片子。", .info)
+            }
+            if !status.media.isDVD, status.media != .unknown {
+                return ("这张是 \(status.media.displayName)：视频 DVD 只能刻在 DVD±R / DVD±RW 上，"
+                    + "CD 装不下一部片子的 MPEG-2。", .error)
+            }
+            guard Multisession.needsGraft(status: status) else { return nil }
+            if status.erasable || status.media.isRewritable {
+                return ("视频 DVD 不能追加刻录：刻录前会先擦除这张盘，然后再把整张 DVD 写进去。", .warning)
+            }
+            return ("这张 \(status.media.displayName) 上已经有内容，而视频 DVD 不能追加刻录。"
+                + "请换一张空白 DVD±R，或用可重写的 DVD±RW 擦除后再刻。", .error)
+        }
         // 只有「盘上已经有内容、还能接着写」才有追加这回事：空白盘（哪怕是可重写盘）段数是 1，
         // 但那是空白轨道，不是已有内容。
         guard status.isPresent, Multisession.needsGraft(status: status) else { return nil }
@@ -550,6 +743,13 @@ final class AppModel: ObservableObject {
             return SpeedAdvisor.audioAdvice(
                 reportedSpeeds: status.writeSpeeds,
                 trackCount: items.count
+            )
+        }
+        // 视频 DVD 也一样：刻完是给 DVD 播放机读的，慢一点播放机更不容易卡。
+        if mode == .videoDVD {
+            return SpeedAdvisor.videoAdvice(
+                reportedSpeeds: status.writeSpeeds,
+                titleCount: items.count
             )
         }
         return SpeedAdvisor.advise(
@@ -626,7 +826,7 @@ final class AppModel: ObservableObject {
     }
 
     func runCompatibilityScan(reveal: Bool = false) {
-        // 音乐 CD 的盘上没有文件名，这一步对它没有意义：清掉旧结果就行。
+        // 音乐 CD / 视频 DVD 都不是「一堆文件刻进文件系统」，文件名兼容性对它们没意义：清掉旧结果就行。
         guard mode == .data else {
             compatibility = nil
             compatibilityScanning = false
@@ -667,6 +867,14 @@ final class AppModel: ObservableObject {
             burnPrep = BurnPrep(report: report, summary: burnSummary(), isAudio: true)
             return
         }
+        // 视频 DVD 也一样：盘上是 VIDEO_TS 结构，没有「文件名兼容性」这回事。
+        if mode == .videoDVD {
+            var report = CompatibilityReport()
+            report.fileCount = items.count
+            report.totalBytes = videoEstimatedBytes
+            burnPrep = BurnPrep(report: report, summary: burnSummary(), isVideo: true)
+            return
+        }
         let urls = items.map { $0.url }
         let rules = nameRules
         let summary = burnSummary()
@@ -687,6 +895,9 @@ final class AppModel: ObservableObject {
     func burnSummary() -> String {
         if mode == .audioCD {
             return audioBurnSummary()
+        }
+        if mode == .videoDVD {
+            return videoBurnSummary()
         }
         let size = ByteText.human(totalBytes)
         let media = status.isPresent ? status.media.displayName : "未知介质"
@@ -719,6 +930,23 @@ final class AppModel: ObservableObject {
     }
 
     /// 确认单里的速度一行。
+    /// 视频 DVD 的确认单：按时长与码率说话，不按源文件大小。
+    private func videoBurnSummary() -> String {
+        let media = status.isPresent ? status.media.displayName : "未知介质"
+        var text = "把 \(items.count) 个节目（合计 \(AudioDisc.timeText(videoTotalDuration))）"
+            + "转成 DVD-Video，写到 \(media)。"
+        text += "\n画面：\(videoStandard.localizedName) \(videoStandard.width)×\(videoStandard.height) "
+            + "\(videoAspectText) · 视频码率 \(videoBitrateText) · 每个节目每 5 分钟一个章节"
+        text += "\n预计占 \(ByteText.human(videoEstimatedBytes))，这张盘有 \(ByteText.human(videoCapacityBytes))"
+            + "（转码过程还要约 \(ByteText.human(videoEstimatedBytes + VideoDVD.workspaceMarginBytes)) 临时空间）。"
+        text += "\n盘上是 VIDEO_TS 结构：用 DVD 播放机 / 蓝光机 / 播放软件看，访达里看不到「文件」。"
+        if status.isPresent, Multisession.needsGraft(status: status) {
+            text += "\n⚠︎ 这张盘上已经有内容，而视频 DVD 不能追加：刻录前会先擦除这张盘。"
+        }
+        text += "\n刻录速度：\(speedSummaryLine)"
+        if testBurn { text += "\n测试模式不会写入介质，只验证流程。" }
+        return text
+    }
     var speedSummaryLine: String {
         guard let speed = effectiveSpeed else { return "自动（由驱动器选择）" }
         let estimated = status.isPresent
@@ -985,13 +1213,14 @@ final class AppModel: ObservableObject {
     func buildRequest(imageOnlyURL: URL?) -> BurnRequest {
         let name = ImageBuilder.normalizeVolumeName(volumeName)
         let imageOptions = self.imageOptions
-       let burnOptions = BurnOptions(
+        let burnOptions = BurnOptions(
             driveIndex: selectedDriveIndex,
             speed: effectiveSpeed,
             verify: mode == .audioCD ? false : verify,
             ejectWhenDone: ejectWhenDone,
             testBurn: testBurn,
-            closeDisc: mode == .audioCD ? true : closeDisc,
+            // 音乐 CD 与视频 DVD 都要一次写完并收尾（多区段的这两种盘，播放机只认第一段）。
+            closeDisc: mode == .data ? closeDisc : true,
             eraseFirst: false,
             appendStrategy: mode == .data && willMergeWholeDisc ? .rewriteMerged : .graft
         )
@@ -999,6 +1228,7 @@ final class AppModel: ObservableObject {
             items: items.map { $0.url },
             volumeName: name,
             mode: mode,
+            videoStandard: videoStandard,
             imageOptions: imageOptions,
             burnOptions: burnOptions,
             imageOnlyURL: imageOnlyURL,

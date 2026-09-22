@@ -51,6 +51,7 @@ func usage() {
       discburn image <路径…> -o <输出.iso>   只生成光盘映像文件
       discburn burn <路径…> [选项]           刻录到光盘
       discburn audio <路径…> [选项]          刻成音乐 CD（红皮书音轨，CD 机能放）
+      discburn dvd <路径…> [选项]            刻成视频 DVD（DVD-Video，播放机能放）
       discburn erase [--mode quick|full]    擦除可重写光盘
       discburn eject                        弹出光盘
       discburn --version                    显示版本号
@@ -62,6 +63,16 @@ func usage() {
       · 只能刻在 CD-R / CD-RW 上，一张 80 分钟的盘大约放 80 分钟音频
       · 不能追加：盘上有内容时会先擦（只有 CD-RW 擦得掉），音轨按列表顺序写
       · 倍速默认 8x：老 CD 机对高倍速刻出来的音轨更挑
+
+    \(bold("视频 DVD"))
+      视频 DVD 写的是 DVD-Video：把视频转成 MPEG-2，排成标准的 VIDEO_TS 目录，
+      DVD 播放机 / 蓝光机 / 电脑都能放，遥控器上还能跳章节。
+      · 只收视频：MP4 / MOV / MKV / AVI / M4V / MPEG / TS / M2TS / WMV / WebM 等
+      · 只能刻在 DVD±R / DVD±RW 上，一张单层盘放得下大约 2 小时（按素材总时长自动定码率）
+      · 不能追加：盘上有内容时会先擦（只有可重写的 DVD±RW 擦得掉）
+      · 一个 VTS 只能有一种画面比例，所以整张盘统一按 16:9 做（4:3 的素材左右补黑边）
+      · 默认 PAL（中国大陆 / 欧洲），要给美国 / 日本的播放机用就加 --ntsc
+      · 需要 ffmpeg、ffprobe 与 dvdauthor；没装时程序会给出安装指引
 
     \(bold("刻录选项"))
       --name <卷标>        光盘卷标（默认 DiscBurn_日期）
@@ -75,6 +86,8 @@ func usage() {
       --test               测试模式（不打开激光，不写入介质）
       --erase-first        刻录前先快速擦除（仅可重写介质）
       --close              关闭光盘，之后无法再追加
+      --dvd                刻成视频 DVD（同 discburn dvd）
+      --ntsc / --pal       视频 DVD 用哪种制式（默认 PAL）
       --merge              可重写介质上追加时「整盘合并重刻」：先读盘上已有内容，
                            和这次要刻的合成一份，擦盘再单段刻完。
                            保证 Windows / macOS / Linux 看到的是同一份完整内容
@@ -94,6 +107,9 @@ func usage() {
       discburn burn ~/Documents --fix-names       # 自动改名后再刻
       discburn audio ~/Music/旅行歌单 --speed 8   # 刻成音乐 CD
       discburn audio ~/Downloads/专辑/            # 文件夹会自动找里面的音频文件
+      discburn dvd ~/Movies/婚礼跟拍 --name WEDDING --speed 4
+      discburn dvd ~/Movies/老片修复 --ntsc       # 给美国 / 日本的播放机用 NTSC
+      discburn plan ~/Movies/纪录片 --dvd          # 先看码率与容量，不写盘
       discburn image ~/Pictures -o ~/Desktop/照片.iso
       discburn erase --mode full
     """)
@@ -107,6 +123,8 @@ struct Options {
     var volumeName: String?
     /// 刻数据光盘还是音乐 CD。
     var mode: DiscMode = .data
+    /// 视频 DVD 的制式。
+    var videoStandard: VideoStandard = .pal
     var driveIndex: Int?
     var verify = true
     var eject = true
@@ -186,6 +204,8 @@ func parse(_ arguments: [String]) throws -> Options {
             options.command = "burn"
         case "audio", "music", "音乐":
             options.command = "audio"
+        case "dvd", "video", "视频":
+            options.command = "dvd"
         case "erase":
             options.command = "erase"
         case "eject":
@@ -239,8 +259,14 @@ func parse(_ arguments: [String]) throws -> Options {
             options.closeDisc = true
         case "--audio", "-a":
             options.mode = .audioCD
+        case "--dvd", "--video":
+            options.mode = .videoDVD
         case "--data":
             options.mode = .data
+        case "--ntsc":
+            options.videoStandard = .ntsc
+        case "--pal":
+            options.videoStandard = .pal
         case "--merge":
             options.appendStrategy = .rewriteMerged
         case "--append":
@@ -511,6 +537,11 @@ func runJob(_ options: Options, output: URL?) throws {
         try runAudioJob(options)
         return
     }
+    // 视频 DVD 也是独立的一条流水线（要先转码、排 VIDEO_TS，再当成一整张映像写下去）。
+    if options.mode == .videoDVD {
+        try runVideoJob(options, output: output)
+        return
+    }
     let imageOptions = makeImageOptions(options)
 
     // 先做兼容性预检：默认只提示，--strict 时有「需处理」的问题就中止。
@@ -693,7 +724,157 @@ func resolveAudioSpeed(_ options: Options, plan: AudioDiscPlan) -> SpeedPlan {
 }
 
 /// plan 命令：整理后只估算容量与所需介质。
+/// 视频 DVD：先探测素材、算出码率给用户看一眼，再走「转码 → 排 VIDEO_TS → 做映像 → 写盘」。
+func runVideoJob(_ options: Options, output: URL?) throws {
+    guard !options.paths.isEmpty else {
+        throw UsageError(message: "dvd 需要至少一个视频文件或文件夹路径")
+    }
+    let missing = VideoDVD.missingTools
+    guard missing.isEmpty else {
+        throw VideoDVDError.missingTool(name: missing.joined(separator: "、"), hint: VideoDVD.installHint)
+    }
+
+    print(bold("[视频清单] ") + "正在读取视频信息…")
+    // 只生成映像时不用看光驱；要写盘就按这张盘的实际剩余空间算码率。
+    let drives = (try? DriveService.listDrives()) ?? []
+    let drive = options.driveIndex.flatMap { index in drives.first { $0.index == index } } ?? drives.first
+    let status = drive.flatMap { try? DriveService.status(driveIndex: $0.index) }
+    let capacity = (output == nil ? status?.writableBytes : nil)
+        ?? VideoDVD.capacityBytes(for: status?.media ?? .unknown)
+
+    let plan = try VideoDVD.plan(
+        items: options.paths,
+        standard: options.videoStandard,
+        capacityBytes: capacity
+    ) { done, total, url in
+        guard !options.quiet, total > 0, done > 0, done % 5 == 0 else { return }
+        print(dim("  …已读取 \(done)/\(total)：\(url.lastPathComponent)"))
+    }
+    guard !plan.sources.isEmpty else { throw VideoDVDError.noVideoFiles }
+
+    for source in plan.sources {
+        print(String(format: "  %2d.  %@  %@", source.id, source.durationText, source.title)
+            + dim("  \(source.formatSummary)"))
+        if !options.quiet {
+            print(dim("        " + source.sourceURL.path))
+        }
+    }
+    if !plan.skipped.isEmpty {
+        print(yellow("  跳过 \(plan.skipped.count) 个不能当视频源的内容："))
+        for skip in plan.skipped.prefix(10) {
+            print(dim("    · \(skip.displayName)：\(skip.reason)"))
+        }
+        if plan.skipped.count > 10 {
+            print(dim("    …还有 \(plan.skipped.count - 10) 个"))
+        }
+    }
+
+    print(bold("[排布] ") + plan.summary)
+    print("  视频码率 \(plan.bitrateText) · 换算后预计占 \(ByteText.human(plan.estimatedBytes))"
+        + "，这张盘有 \(ByteText.human(plan.capacityBytes))")
+    print(dim("  （一个 VTS 只能有一种画面比例，所以整张盘统一按 \(plan.aspectText) 做）"))
+    print(dim("  转码需要一个约 \(ByteText.human(plan.stagedBytes)) 的临时目录。"))
+    try VideoDVD.validate(plan: plan, force: options.force)
+    try checkVideoMedia(options, status: status, imageOnly: output != nil)
+
+    let speed = resolveVideoSpeed(options)
+    if !options.quiet {
+        print(bold("[刻录速度] ") + speed.note)
+        if let caution = speed.caution { print(yellow("  ⚠︎ " + caution)) }
+    }
+    print("")
+
+    let request = BurnRequest(
+        items: options.paths,
+        volumeName: options.volumeName ?? "VIDEO_DVD",
+        mode: .videoDVD,
+        videoStandard: options.videoStandard,
+        burnOptions: BurnOptions(
+            driveIndex: options.driveIndex,
+            speed: speed.speed,
+            verify: options.verify,
+            ejectWhenDone: options.eject,
+            testBurn: options.test,
+            closeDisc: true,
+            eraseFirst: options.eraseFirst,
+            appendStrategy: .graft
+        ),
+        imageOnlyURL: output,
+        force: options.force,
+        keepWorkspace: options.keep
+    )
+    let outcome = try execute(request, options: options)
+    print("")
+    if let image = outcome.imageURL, output != nil {
+        print(green("✔ 映像已生成：\(image.path)"))
+        print(dim("  大小 \(ByteText.human(outcome.payloadBytes)) · \(plan.summary)"))
+        print(dim("  这个 .iso 可以直接用别的刻录软件写，也可以再执行 discburn burn <映像> 刻到盘上。"))
+    } else if outcome.wasTestBurn {
+        print(green("✔ 测试刻录完成") + dim(" 用时 \(String(format: "%.1f", outcome.duration)) 秒"))
+    } else {
+        print(green("✔ 刻录完成：视频 DVD \(outcome.videoTitleCount) 个节目")
+            + " · 总时长 \(AudioDisc.timeText(outcome.videoDuration))")
+        print(dim("  用时 \(String(format: "%.1f", outcome.duration)) 秒 · "
+            + "盘上是 VIDEO_TS 结构，用 DVD 播放机 / 蓝光机 / 电脑的播放器放，电脑的访达里看不到「文件」"))
+    }
+}
+
+/// 视频 DVD 的介质检查：CD 装不下，蓝光的 BDMV 是另一套结构。
+func checkVideoMedia(_ options: Options, status: DiscStatus?, imageOnly: Bool) throws {
+    guard !imageOnly, let status = status else { return }
+    guard status.isPresent else { throw BurnError.noMedia }
+    guard status.media.isDVD || status.media == .unknown else {
+        throw VideoDVDError.requiresDVDMedia(status.media.displayName)
+    }
+}
+
+/// 视频 DVD 的倍速：默认 4x，理由跟数据盘不同（家用播放机的纠错能力不如电脑光驱）。
+func resolveVideoSpeed(_ options: Options) -> SpeedPlan {
+    let drives = (try? DriveService.listDrives()) ?? []
+    let drive = options.driveIndex.flatMap { index in drives.first { $0.index == index } } ?? drives.first
+    let status = drive.flatMap { try? DriveService.status(driveIndex: $0.index) }
+    let advice = SpeedAdvisor.videoAdvice(reportedSpeeds: status?.writeSpeeds ?? [])
+    switch options.speedMode {
+    case .automatic:
+        return SpeedPlan(speed: nil, note: "自动（由驱动器选择，通常是它能跑的最高倍速）", caution: nil)
+    case .fixed(let value):
+        return SpeedPlan(speed: value, note: "\(value)x（手动指定）", caution: advice.caution(for: value))
+    case .recommended:
+        guard let speed = advice.recommended else {
+            return SpeedPlan(speed: nil, note: "自动（\(advice.reason)）", caution: nil)
+        }
+        return SpeedPlan(speed: speed, note: "推荐 \(speed)x · \(advice.reason)", caution: nil)
+    }
+}
 func runPlanOnly(_ options: Options) throws {
+    // 视频 DVD 的「预演」：只探测素材、算码率与容量，不转码、不写盘。
+    if options.mode == .videoDVD {
+        let missing = VideoDVD.missingTools
+        guard missing.isEmpty else {
+            throw VideoDVDError.missingTool(name: missing.joined(separator: "、"), hint: VideoDVD.installHint)
+        }
+        let plan = try VideoDVD.plan(items: options.paths, standard: options.videoStandard)
+        guard !plan.sources.isEmpty else { throw VideoDVDError.noVideoFiles }
+        print(bold("[预演] ") + "视频 DVD：" + plan.summary)
+        for source in plan.sources {
+            print(String(format: "  %2d.  %@  %@", source.id, source.durationText, source.title)
+                + dim("  \(source.formatSummary)"))
+        }
+        if !plan.skipped.isEmpty {
+            print(yellow("  跳过 \(plan.skipped.count) 个不能当视频源的内容："))
+            for skip in plan.skipped.prefix(10) {
+                print(dim("    · \(skip.displayName)：\(skip.reason)"))
+            }
+        }
+        let verdict = plan.isOverCapacity
+            ? red("✘ 装不下，超了 \(ByteText.human(-plan.remainingBytes))")
+            : green("✔ 装得下，还剩 \(ByteText.human(plan.remainingBytes))")
+        print("  视频码率 \(plan.bitrateText) · 预计占 \(ByteText.human(plan.estimatedBytes))，"
+            + "一张单层 DVD 有 \(ByteText.human(plan.capacityBytes)) → \(verdict)")
+        print(dim("  转码需要一个约 \(ByteText.human(plan.stagedBytes)) 的临时目录。"))
+        print(dim("  刻成碟后是 VIDEO_TS 结构，用 DVD 播放机放；电脑的访达里看不到「文件」。"))
+        return
+    }
     // 音乐 CD 的「预演」：只列音轨与时长，不转码、不写盘。
     if options.mode == .audioCD {
         let plan = try AudioDisc.plan(items: options.paths)
@@ -1035,6 +1216,9 @@ do {
     case "burn": try commandBurn(options: options)
     case "audio":
         options.mode = .audioCD
+        try commandBurn(options: options)
+    case "dvd":
+        options.mode = .videoDVD
         try commandBurn(options: options)
     case "erase": try commandErase(options: options)
     case "eject": try commandEject(options: options)

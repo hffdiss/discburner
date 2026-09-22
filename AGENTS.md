@@ -10,6 +10,7 @@
 - **不要用 `swift build`**：这台机器只有 Command Line Tools（无 Xcode），SwiftPM 会因为没有 xctest 失败。
   构建一律用 `./build.sh`（约 110 秒，产出 `dist/DiscBurner.app`、`.dmg`、`.zip`）。
 - **自检必须全过**：`./.build-manual/universal/discburn-selftest`，加一条断言就要同步更新 README 里的项数。
+  （当前 **654 项**；README 里多处写着这个数字，加断言时一起改。）
 - **编译产物不进仓库**：`.build-manual/`、`build/`、`dist/` 已在 `.gitignore` 里，靠 `build.sh` 重新生成。
 - **每个版本有自己的目录**：`build.sh` 打包后会在 `dist/v<版本>/` 里放这一版的
   App、dmg、zip 和 `SHA256.txt`（本地归档，同样不进仓库）。
@@ -100,6 +101,50 @@
   这也是为什么 30 首 4 分钟的歌正好放不下。临时空间要留够：一小时音频 ≈ 600 MB AIFF。
 - **倍速默认 8x**（`SpeedAdvisor.audioAdvice`）：音频盘跟数据盘不是一回事，老 CD 机、车载音响的误码纠正能力弱，
   对高倍速刻出来的音轨更挑。
+
+## 视频 DVD（DVD-Video）
+
+- **盘上不是「一堆文件」**：写的是 `VIDEO_TS` 里的 IFO / BUP / VOB，节目结构写在 IFO 里。
+  访达里只看到一个 `VIDEO_TS` 文件夹是正常的，别去「修」。
+- **流水线**：`ffprobe` 探测 → `ffmpeg` 转成 DVD 兼容 MPEG-PS → `dvdauthor` 排 `VIDEO_TS`
+  → `mkisofs -dvd-video` 做 UDF 1.02 映像 → `drutil burn`（一次性收尾）。四步的工具都别换成别的。
+- **dvdauthor 的 XML 必须带 VMGM 的制式**，否则它报
+  `no default video format, must explicitly specify NTSC or PAL` 并且**根本不生成 `VIDEO_TS.IFO`**
+  ——刻出来是一张放不了的盘，而且退出码可能还是 0。所以在 `<vmgm>` 里必须写：
+
+  ```xml
+  <vmgm>
+    <menus>
+      <video format="pal" aspect="16:9" />
+    </menus>
+  </vmgm>
+  ```
+
+  `VideoDVDStager.author` 收尾时还会核对 `VIDEO_TS.IFO` / `VTS_01_0.IFO` / 至少一个 `.VOB` 是否存在，
+  缺一个就中止，别把「dvdauthor 没报错」当成成功。
+- **`jump title N` 只在同一个 VTS 内编号**（跨 titleset 会直接报 `Cannot jump to title #2, only 1 exist`），
+  而 dvdauthor 的文档也写明 titleset 之间不该互跳。所以所有节目放进**一个** titleset、按 `<pgc>` 顺序排，
+  最后一段 `<post> exit; </post>`。连带结果是：**一个 VTS 只有一种画面比例**，
+  整张盘按「有没有宽屏素材」统一 16:9 或 4:3，比例不同的素材补黑边（不裁切）。
+  要每段各自的比例、或者要菜单，就得做带按钮的 VMGM 菜单，那是另一件事。
+- **`dvdauthor.xml` 不能留在要做映像的那一层目录**：那一层会被整个做成映像，留在里面光盘根目录就会多出
+  一个 xml，不再是干净的 DVD-Video 结构。现在写在上一级（`VideoDVDStager.author` 里，自检有回归用例）。
+- **映像只认 `mkisofs -dvd-video`（cdrtools）或 `hdiutil makehybrid -udf-version 1.02`**。
+  **`xorriso -as mkisofs` 没有 `-dvd-video` / `-udf`**（grep 参数表 0 命中），别想着拿它顶。
+- **转码参数别乱改**：`mpeg2video` + `mp2` 192k + 48 kHz + 立体声 + `-f dvd`；
+  滤镜链结尾那个 `setsar=64/45`（NTSC 是 40/33）是必须的——DVD 的 720×576 不是方形像素，
+  少了它播放机上的画面会被横向拉扁。反交错只对 `ffprobe` 报隔行的素材做（`yadif=0`），逐行素材加了只会变糊。
+- **没有音轨的素材要补一条静音轨**（`-f lavfi -i anullsrc=...` + `-shortest`）：DVD 要求每段都有音频流。
+- **只能刻 DVD±R / DVD±RW**，**不能追加**（播放机只认盘开头的 `VIDEO_TS`）：盘上有内容时只有可重写的
+  先擦再刻，一次性介质直接报错换盘。容量按驱动器报的剩余空间算，拿不到就按单层 4.38 GiB。
+- **码率是按总时长倒推的**（`VideoDVD.recommendedVideoBitrate`，1.5–8 Mbps，往下取整到 100 kbps），
+  装不下时返回 **0** 让调用方报「超容量」，别悄悄给个最低码率硬刻。
+- **依赖装的坑**：`dvdauthor` 直接 `brew install dvdauthor`；`ffmpeg` 在 Intel Mac 上
+  Homebrew **已经没有 x86_64 的 bottle**（`no bottle available`，会转成源码编译），
+  实测的路子是下 evermeet.cx 的静态版 `ffmpeg` / `ffprobe`，`xattr -dr com.apple.quarantine`
+  之后放进 `/usr/local/bin/`。这台机器上这两个工具已经装好（`/usr/local/bin/`），但换机器要重新装，
+  所以程序必须优雅处理「没装 ffmpeg」——现在会报缺哪个工具并给出上面的指引。
+- 截屏参数：`--demo-video`（配合 `--demo-items <视频路径…>`）。
 
 ## 看界面的正确姿势
 

@@ -134,16 +134,24 @@ cat > "$CONTENTS/Resources/命令行工具说明.txt" <<EOF
     discburn burn ~/Documents --fix-names
     discburn burn ~/backup.iso
     discburn audio ~/Music/旅行歌单 --speed 8
+    discburn dvd ~/Movies/婚礼跟拍 --name WEDDING
     discburn erase --mode quick
     discburn --version
 
 刻录前会先做兼容性预检（Windows 非法字符、保留名、大小写冲突、超长名…），
 加 --fix-names 可以自动把不兼容的名字改掉（只改光盘里的副本）。
 
-音乐 CD：`discburn audio <音频文件或文件夹>`
+音乐 CD：discburn audio <音频文件或文件夹>
   把 MP3 / M4A / AAC / WAV / AIFF / ALAC / FLAC 转成红皮书音轨刻进 CD-R / CD-RW，
   CD 机、车载音响能直接放。盘上没有文件系统（电脑看不到「文件」），不能追加。
-  只想先看装不装得下：`discburn plan <路径…> --audio`
+  只想先看装不装得下：discburn plan <路径…> --audio
+
+视频 DVD：discburn dvd <视频文件或文件夹>
+  把 MP4 / MOV / MKV / AVI 等转成 DVD-Video（MPEG-2），排成标准的 VIDEO_TS 目录，
+  DVD 播放机 / 蓝光机 / 播放软件都能放，每个节目每 5 分钟一个章节。
+  只能刻在 DVD±R / DVD±RW 上，不能追加；默认 PAL，要 NTSC 加 --ntsc。
+  需要 ffmpeg、ffprobe 与 dvdauthor（没装时命令会给出安装指引）。
+  只想先看码率与容量：discburn plan <路径…> --dvd
 
 运行 discburn --help 查看全部选项。
 

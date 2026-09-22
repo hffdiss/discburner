@@ -141,23 +141,32 @@ struct ContentView: View {
                                     Image(systemName: "music.note")
                                         .foregroundColor(.accentColor)
                                         .frame(width: 18)
+                                } else if model.mode == .videoDVD {
+                                    // 视频 DVD 的顺序就是节目号（title），播放机按这个顺序往下放。
+                                    Text("\(index + 1)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                        .frame(width: 22, alignment: .trailing)
+                                    Image(systemName: "film")
+                                        .foregroundColor(.accentColor)
+                                        .frame(width: 18)
                                 } else {
                                     Image(systemName: item.isDirectory ? "folder.fill" : iconName(for: item.url))
                                         .foregroundColor(item.isDirectory ? Color.accentColor : .secondary)
                                         .frame(width: 18)
                                 }
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text(model.mode == .audioCD ? trackTitle(for: item) : item.name)
+                                    Text(itemTitle(item))
                                         .lineLimit(1)
-                                    Text(model.mode == .audioCD ? item.name : item.url.deletingLastPathComponent().path)
+                                    Text(itemSubtitle(item))
                                         .font(.system(size: 10))
                                         .foregroundColor(.secondary)
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                 }
                                 Spacer()
-                                Text(model.mode == .audioCD ? item.durationText : item.sizeText)
-                                    .font(.system(size: 11, design: model.mode == .audioCD ? .monospaced : .default))
+                                Text(itemTrailingText(item))
+                                    .font(.system(size: 11, design: model.mode == .data ? .default : .monospaced))
                                     .foregroundColor(.secondary)
                                     .frame(minWidth: 46, alignment: .trailing)
                                 Button {
@@ -196,6 +205,19 @@ struct ContentView: View {
                                 .scaleEffect(0.45)
                                 .frame(width: 12, height: 12)
                         }
+                    } else if model.mode == .videoDVD {
+                        Text("合计 \(AudioDisc.timeText(model.videoTotalDuration))")
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundColor(model.isOverCapacity ? .red : .primary)
+                        Text("· 预计占 \(ByteText.human(model.videoEstimatedBytes)) / \(ByteText.human(model.videoCapacityBytes))")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(model.isOverCapacity ? .red : .secondary)
+                        if model.videoDurationsPending {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle())
+                                .scaleEffect(0.45)
+                                .frame(width: 12, height: 12)
+                        }
                     } else {
                         Text("合计 \(ByteText.human(model.totalBytes))")
                             .font(.system(size: 12, weight: .medium))
@@ -207,7 +229,7 @@ struct ContentView: View {
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }
-                if model.mode == .audioCD, let notice = model.audioSkipNotice {
+                if model.mode != .data, let notice = model.skipNotice {
                     Text(notice)
                         .font(.system(size: 10))
                         .foregroundColor(.orange)
@@ -331,6 +353,35 @@ struct ContentView: View {
         AudioDisc.trackTitle(from: item.url)
     }
 
+    /// 列表里那一行的主标题：音乐 CD 用去掉序号的歌名，视频 DVD 用去掉序号的片名。
+    private func itemTitle(_ item: FileItem) -> String {
+        switch model.mode {
+        case .audioCD: return AudioDisc.trackTitle(from: item.url)
+        case .videoDVD: return VideoDVD.videoTitle(from: item.url)
+        case .data: return item.name
+        }
+    }
+
+    /// 列表里那一行的副标题。
+    private func itemSubtitle(_ item: FileItem) -> String {
+        switch model.mode {
+        case .audioCD:
+            return item.name
+        case .videoDVD:
+            var parts: [String] = []
+            if !item.videoSummary.isEmpty { parts.append(item.videoSummary) }
+            parts.append(item.sizeText)
+            return parts.joined(separator: " · ")
+        case .data:
+            return item.url.deletingLastPathComponent().path
+        }
+    }
+
+    /// 列表里那一行右侧的数字：数据盘是文件大小，音轨 / 节目是时长。
+    private func itemTrailingText(_ item: FileItem) -> String {
+        model.mode == .data ? item.sizeText : item.durationText
+    }
+
     // MARK: - 右侧设置
 
     private var settingsColumn: some View {
@@ -389,6 +440,50 @@ struct ContentView: View {
                     }
                 }
 
+                if model.mode == .videoDVD {
+                    section("视频设置") {
+                        Picker("制式", selection: $model.videoStandard) {
+                            ForEach(VideoStandard.allCases) { standard in
+                                Text(standard.localizedName).tag(standard)
+                            }
+                        }
+                        .disabled(model.isBusy)
+                        Text(model.videoStandard.detail)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        HStack {
+                            Text("画面")
+                            Spacer()
+                            Text("\(model.videoStandard.width)×\(model.videoStandard.height) \(model.videoAspectText)")
+                                .foregroundColor(.secondary)
+                        }
+                        .font(.system(size: 11))
+                        HStack {
+                            Text("视频码率")
+                            Spacer()
+                            Text(model.videoBitrateText)
+                                .foregroundColor(model.isVideoOverCapacity ? .red : .secondary)
+                        }
+                        .font(.system(size: 11))
+                        Text("码率按素材总时长和这张盘的容量自动算：片子越长，码率越低。"
+                            + "一个 VTS 只能有一种画面比例，所以整张盘统一按 \(model.videoAspectText) 做，"
+                            + "比例不一样的素材会补黑边（不裁切）。")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if !model.videoMissingTools.isEmpty {
+                            Text("缺少 \(model.videoMissingTools.joined(separator: "、"))，暂时刻不了视频 DVD。\n"
+                                + "终端执行 \(VideoDVD.installHint)")
+                                .font(.system(size: 10))
+                                .foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+
                 section("刻录选项") {
                     if model.mode == .data {
                         Toggle("刻录后校验数据", isOn: $model.verify)
@@ -399,6 +494,12 @@ struct ContentView: View {
                     if model.mode == .data {
                         Toggle("关闭光盘（之后无法追加数据）", isOn: $model.closeDisc)
                             .disabled(model.isBusy)
+                    } else if model.mode == .videoDVD {
+                        Text("视频 DVD 会一次写完并收尾：播放机只认盘开头的 VIDEO_TS，追加出来的分段读不到。"
+                            + "刻完会自动校验（跟数据盘一样有文件系统可校验）。")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     } else {
                         Text("音乐 CD 会一次写完并收尾：音频盘不能追加（大多数 CD 机只认第一段），"
                             + "也没有文件系统可校验。")
@@ -558,6 +659,12 @@ struct ContentView: View {
         if model.mode == .audioCD {
             // 音乐 CD 不能追加，但可重写盘上已经有内容时可以先擦再刻。
             return model.status.media.isCD
+                && (model.status.canBurn || model.status.erasable || model.status.media.isRewritable)
+        }
+        if model.mode == .videoDVD {
+            // 视频 DVD 只能刻在 DVD 上（CD 装不下一部片子），也不能追加：盘上有内容时先擦。
+            let isDVD = model.status.media.isDVD || model.status.media == .unknown
+            return isDVD
                 && (model.status.canBurn || model.status.erasable || model.status.media.isRewritable)
         }
         return model.status.canBurn
